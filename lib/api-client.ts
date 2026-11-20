@@ -1,43 +1,32 @@
 'use client';
 
-const SESSION_STORAGE_KEY = 'sl_auth_session_token';
+const LEGACY_SESSION_STORAGE_KEY = 'sl_auth_session_token';
 
-export function getSessionToken(): string | null {
-  if (typeof window === 'undefined') return null;
-  try {
-    return window.sessionStorage.getItem(SESSION_STORAGE_KEY);
-  } catch {
-    return null;
-  }
-}
-
-export function setSessionToken(token: string | null | undefined) {
-  if (typeof window === 'undefined' || !token) return;
-  try {
-    window.sessionStorage.setItem(SESSION_STORAGE_KEY, token);
-  } catch {
-    // ignore storage restriction
-  }
-}
-
-export function clearSessionToken() {
+/**
+ * Purges any legacy sessionStorage token left behind by earlier builds.
+ * Active authentication now relies exclusively on HttpOnly + Secure + SameSite cookies.
+ */
+export function clearSessionToken(): void {
   if (typeof window === 'undefined') return;
   try {
-    window.sessionStorage.removeItem(SESSION_STORAGE_KEY);
+    window.sessionStorage.removeItem(LEGACY_SESSION_STORAGE_KEY);
+    window.localStorage.removeItem('school_library_session_token');
   } catch {
-    // ignore
+    // Ignore storage access errors in restricted browsing contexts
   }
 }
 
+// Run one-time cleanup when loaded in the browser
+if (typeof window !== 'undefined') {
+  clearSessionToken();
+}
+
+/**
+ * Authenticated fetch wrapper relying strictly on HttpOnly session cookies (no JS-accessible tokens).
+ */
 export function authFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
-  const token = getSessionToken();
-  const nextHeaders = new Headers(init.headers);
-  if (token && !nextHeaders.has('Authorization')) {
-    nextHeaders.set('Authorization', `Bearer ${token}`);
-  }
   return fetch(input, {
     ...init,
-    credentials: 'include',
-    headers: nextHeaders,
+    credentials: 'same-origin',
   });
 }

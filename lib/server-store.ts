@@ -30,8 +30,11 @@ import {
   type ParsedStudentWorkbookResult,
 } from './student-parser';
 
-const DATA_DIR = path.resolve(process.cwd(), '.data');
-const DB_FILE = path.join(DATA_DIR, 'library-store.json');
+import { resolveWritableDataDir } from './storage-dir';
+
+const globalStore = globalThis as unknown as {
+  __slMemoryDb?: LibraryDatabase;
+};
 
 // Serialized promise queue to guarantee transactional consistency for concurrent requests
 let writeLock: Promise<unknown> = Promise.resolve();
@@ -66,31 +69,48 @@ function defaultDatabase(): LibraryDatabase {
   };
 }
 
-function ensureDataDir() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
+function getDbFilePath(): string | null {
+  const dir = resolveWritableDataDir();
+  if (!dir) return null;
+  return path.join(dir, 'library-store.json');
 }
 
 export function readDb(): LibraryDatabase {
-  ensureDataDir();
-  if (!fs.existsSync(DB_FILE)) {
-    const initial = defaultDatabase();
-    writeDbAtomic(initial);
-    return initial;
+  const dbFile = getDbFilePath();
+  if (dbFile && fs.existsSync(dbFile)) {
+    try {
+      const raw = fs.readFileSync(dbFile, 'utf8');
+      const parsed = JSON.parse(raw) as LibraryDatabase;
+      if (!Array.isArray(parsed.teachers)) parsed.teachers = [];
+      if (!Array.isArray(parsed.studentImportBackups)) parsed.studentImportBackups = [];
+      globalStore.__slMemoryDb = parsed;
+      return parsed;
+    } catch (err) {
+      console.error('[server-store] Failed to read library-store.json; using fallback state:', err);
+    }
   }
-  const raw = fs.readFileSync(DB_FILE, 'utf8');
-  const parsed = JSON.parse(raw) as LibraryDatabase;
-  if (!Array.isArray(parsed.teachers)) parsed.teachers = [];
-  if (!Array.isArray(parsed.studentImportBackups)) parsed.studentImportBackups = [];
-  return parsed;
+
+  if (globalStore.__slMemoryDb) {
+    return globalStore.__slMemoryDb;
+  }
+
+  const initial = defaultDatabase();
+  writeDbAtomic(initial);
+  return initial;
 }
 
 function writeDbAtomic(db: LibraryDatabase) {
-  ensureDataDir();
-  const tmp = `${DB_FILE}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(db));
-  fs.renameSync(tmp, DB_FILE);
+  globalStore.__slMemoryDb = db;
+  const dbFile = getDbFilePath();
+  if (!dbFile) return;
+
+  try {
+    const tmp = `${dbFile}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(db), { mode: 0o600 });
+    fs.renameSync(tmp, dbFile);
+  } catch (err) {
+    console.warn('[server-store] Failed to persist library-store.json; keeping state in memory:', err);
+  }
 }
 
 /**

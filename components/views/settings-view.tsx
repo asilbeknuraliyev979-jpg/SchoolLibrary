@@ -5,7 +5,7 @@ import { Download, KeyRound, Save, ShieldCheck } from 'lucide-react';
 import { toast } from 'sonner';
 import { useLibrary } from '@/components/library-context';
 import { Button, FieldLabel, Input, PanelCard } from '@/components/ui/primitives';
-import { authFetch, setSessionToken } from '@/lib/api-client';
+import { authFetch } from '@/lib/api-client';
 
 export function SettingsView() {
   const { data, user, refreshData, downloadFullXlsx } = useLibrary();
@@ -81,7 +81,6 @@ export function SettingsView() {
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || 'Parolni yangilashda xatolik.');
-      if (json.sessionToken) setSessionToken(json.sessionToken);
       setCurrentPassword('');
       setNewPassword('');
       setConfirmPassword('');

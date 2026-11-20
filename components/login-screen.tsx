@@ -5,7 +5,7 @@ import { BookOpen, Eye, EyeOff } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button, FieldLabel, Input } from '@/components/ui/primitives';
 import { useLibrary } from '@/components/library-context';
-import { authFetch, setSessionToken } from '@/lib/api-client';
+import { authFetch } from '@/lib/api-client';
 
 export function LoginScreen() {
   const { setupRequired, refreshSession } = useLibrary();
@@ -50,7 +50,6 @@ export function LoginScreen() {
         setError(json.error || 'Login yoki parol noto‘g‘ri.');
         return;
       }
-      if (json.sessionToken) setSessionToken(json.sessionToken);
       toast.success('Xush kelibsiz, Nodira opa!');
       await refreshSession();
     } catch {
