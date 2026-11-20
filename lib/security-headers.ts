@@ -71,14 +71,23 @@ export function isPreviewIframeHost(hostHeader: string | null | undefined): bool
 export function buildContentSecurityPolicy(options: {
   allowPreviewIframe: boolean;
   isDev: boolean;
+  nonce?: string;
 }): string {
-  const scriptSrc = [
-    "'self'",
-    "'unsafe-inline'",
-    ...(options.isDev ? ["'unsafe-eval'"] : []),
-    'https://apis.google.com',
-    'https://www.gstatic.com',
-  ].join(' ');
+  const scriptSrc = options.nonce
+    ? [
+        "'self'",
+        `'nonce-${options.nonce}'`,
+        "'strict-dynamic'",
+        ...(options.isDev ? ["'unsafe-eval'"] : []),
+        'https://apis.google.com',
+        'https://www.gstatic.com',
+      ].join(' ')
+    : [
+        "'self'",
+        ...(options.isDev ? ["'unsafe-inline'", "'unsafe-eval'"] : []),
+        'https://apis.google.com',
+        'https://www.gstatic.com',
+      ].join(' ');
 
   const connectSrc = [
     "'self'",

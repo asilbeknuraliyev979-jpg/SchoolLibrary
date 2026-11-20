@@ -60,7 +60,7 @@ export async function POST(req: NextRequest) {
       );
       return NextResponse.json(
         {
-          error: `Juda ko‘p urinish. Iltimos, ${limitStatus.retryAfterMinutes} daqiqadan keyin qayta urinib ko‘ring.`,
+          error: 'Juda ko‘p urinish. Bir ozdan keyin qayta urinib ko‘ring.',
         },
         {
           status: 429,
@@ -86,7 +86,7 @@ export async function POST(req: NextRequest) {
       if (attempt.locked) {
         return NextResponse.json(
           {
-            error: `Juda ko‘p urinish. Iltimos, ${attempt.retryAfterMinutes} daqiqadan keyin qayta urinib ko‘ring.`,
+            error: 'Juda ko‘p urinish. Bir ozdan keyin qayta urinib ko‘ring.',
           },
           {
             status: 429,

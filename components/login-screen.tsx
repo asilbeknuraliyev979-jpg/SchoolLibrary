@@ -10,7 +10,7 @@ import { authFetch } from '@/lib/api-client';
 export function LoginScreen() {
   const { setupRequired, refreshSession } = useLibrary();
 
-  const [username, setUsername] = useState('nodira.library');
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [showPass, setShowPass] = useState(false);
@@ -83,7 +83,7 @@ export function LoginScreen() {
               id="login-username"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              placeholder="nodira.library"
+              placeholder="Loginingizni kiriting"
               autoComplete="username"
               required
             />

@@ -320,7 +320,7 @@ export function initializeLibrarianPassword(username: string, initialPassword: s
     throw new Error('Hisob allaqachon sozlangan. Iltimos, parol bilan kiring.');
   }
   if (username.trim().toLowerCase() !== state.account.username) {
-    throw new Error(`Faqat ${state.account.username} asosiy hisobi uchun boshlang‘ich parol o‘rnatish mumkin.`);
+    throw new Error('Login noto‘g‘ri. Faqat asosiy kutubxonachi hisobi uchun parol o‘rnatish mumkin.');
   }
   if (initialPassword.length < 8) {
     throw new Error('Parol kamida 8 ta belgidan iborat bo‘lishi kerak.');

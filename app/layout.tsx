@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import { headers } from 'next/headers';
 import { Inter, JetBrains_Mono } from 'next/font/google';
 import { Toaster } from 'sonner';
 import './globals.css';
@@ -36,9 +37,12 @@ export const metadata: Metadata = {
   },
 };
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+export default async function RootLayout({ children }: { children: React.ReactNode }) {
+  // Reading x-nonce opts SSR into per-request dynamic rendering so Next.js applies the CSP nonce automatically
+  const hdrs = await headers();
+  const nonce = hdrs.get('x-nonce') ?? undefined;
   return (
-    <html lang="uz" className={`${inter.variable} ${jetbrainsMono.variable}`}>
+    <html lang="uz" className={`${inter.variable} ${jetbrainsMono.variable}`} data-csp-nonce={nonce ? 'active' : undefined}>
       <body suppressHydrationWarning className="min-h-screen bg-[#F8FAFC] text-[#0F172A] antialiased">
         <ErrorBoundary>
           <LibraryProvider>

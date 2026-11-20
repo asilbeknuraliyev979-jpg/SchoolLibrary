@@ -88,12 +88,19 @@ test('CORS origin allowlist allows production domain and rejects untrusted origi
   assert.equal(isAllowedOrigin(null, 'https://schoolibrary.vercel.app'), true);
 });
 
-test('CSP and frame protection enforce frame-ancestors none on Vercel production', () => {
+test('CSP and frame protection enforce nonce-based script-src without unsafe-inline on Vercel production', () => {
   assert.equal(isPreviewIframeHost('schoolibrary.vercel.app'), false);
-  const csp = buildContentSecurityPolicy({ allowPreviewIframe: false, isDev: false });
+  const csp = buildContentSecurityPolicy({
+    allowPreviewIframe: false,
+    isDev: false,
+    nonce: 'testNonce123',
+  });
   assert.ok(csp.includes("default-src 'self'"));
+  assert.ok(csp.includes("script-src 'self' 'nonce-testNonce123' 'strict-dynamic'"));
+  const scriptSrcDirective = csp.split(';').find((d) => d.trim().startsWith('script-src')) ?? '';
+  assert.ok(!scriptSrcDirective.includes("'unsafe-inline'"), 'script-src must not contain unsafe-inline');
+  assert.ok(!scriptSrcDirective.includes("'unsafe-eval'"), 'script-src must not contain unsafe-eval');
   assert.ok(csp.includes("object-src 'none'"));
   assert.ok(csp.includes("frame-ancestors 'none'"));
   assert.ok(csp.includes('upgrade-insecure-requests'));
-  assert.ok(!csp.includes("'unsafe-eval'"));
 });

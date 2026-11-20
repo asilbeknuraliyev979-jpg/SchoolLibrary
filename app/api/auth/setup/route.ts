@@ -23,7 +23,7 @@ export async function POST(req: NextRequest) {
     const limit = checkRateLimitKey(setupKey);
     if (!limit.allowed) {
       return NextResponse.json(
-        { error: `Juda ko‘p urinish. Iltimos, ${limit.retryAfterMinutes} daqiqadan keyin qayta urinib ko‘ring.` },
+        { error: 'Juda ko‘p urinish. Bir ozdan keyin qayta urinib ko‘ring.' },
         {
           status: 429,
           headers: {
