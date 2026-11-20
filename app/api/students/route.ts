@@ -1,71 +1,16 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import ExcelJS from 'exceljs';
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerSession } from '@/lib/auth-server';
-import { bulkImportStudents, createStudent, updateStudent } from '@/lib/server-store';
-import { cellToString } from '@/lib/inventory-parser';
-
-function parseStudentWorksheet(ws: ExcelJS.Worksheet): Array<{ fullName: string; className: string; schoolStudentNumber?: string }> {
-  let classCol = 1;
-  let nameCol = 2;
-  let numCol = -1;
-  let startRow = 2;
-
-  // Detect header row & column positions automatically
-  for (let r = 1; r <= Math.min(5, ws.rowCount); r++) {
-    const row = ws.getRow(r);
-    const vals: string[] = [];
-    for (let c = 1; c <= Math.min(8, ws.columnCount || 5); c++) {
-      vals.push(cellToString(row.getCell(c).value).toLowerCase());
-    }
-    const foundClass = vals.findIndex((v) => v.includes('sinf') || v.includes('class'));
-    const foundName = vals.findIndex(
-      (v) => v.includes('familiya') || v.includes('ism') || v.includes('f.i') || v.includes('name') || v.includes('o‘quvchi') || v.includes("o'quvchi")
-    );
-    const foundNum = vals.findIndex((v) => v.includes('raqam') || v.includes('id') || v.includes('guvoh'));
-    if (foundClass !== -1 && foundName !== -1) {
-      classCol = foundClass + 1;
-      nameCol = foundName + 1;
-      numCol = foundNum !== -1 ? foundNum + 1 : -1;
-      startRow = r + 1;
-      break;
-    }
-  }
-
-  const parsedRows: Array<{ fullName: string; className: string; schoolStudentNumber?: string }> = [];
-  const classPattern = /^\d{1,2}\s*[-–]?\s*[A-Za-zА-Яа-яЁё0-9]+$/;
-
-  for (let r = startRow; r <= ws.rowCount; r++) {
-    const row = ws.getRow(r);
-    let classVal = cellToString(row.getCell(classCol).value);
-    let nameVal = cellToString(row.getCell(nameCol).value);
-    const numVal = numCol > 0 ? cellToString(row.getCell(numCol).value) : '';
-
-    // Fallback: if header wasn't matched and col 2 looks like a class while col 1 is a full name, swap
-    if (classVal && nameVal && !classPattern.test(classVal) && classPattern.test(nameVal)) {
-      const tmp = classVal;
-      classVal = nameVal;
-      nameVal = tmp;
-    }
-
-    if (
-      classVal.toLowerCase() === 'sinf' ||
-      nameVal.toLowerCase().includes('familiya va ism')
-    ) {
-      continue;
-    }
-
-    if (nameVal && classVal) {
-      parsedRows.push({
-        fullName: nameVal,
-        className: classVal,
-        schoolStudentNumber: numVal,
-      });
-    }
-  }
-  return parsedRows;
-}
+import {
+  commitReplaceStudentsTransactional,
+  createStudent,
+  previewReplaceStudents,
+  rollbackLastStudentImport,
+  updateStudent,
+} from '@/lib/server-store';
+import { parseStudentWorkbookBuffer } from '@/lib/student-parser';
+import type { ParsedStudentRow } from '@/lib/types';
 
 export async function POST(req: NextRequest) {
   const session = await getServerSession();
@@ -79,39 +24,76 @@ export async function POST(req: NextRequest) {
     if (contentType.includes('multipart/form-data')) {
       const formData = await req.formData();
       const file = formData.get('file');
+      const mode = String(formData.get('mode') ?? 'preview');
       if (!file || !(file instanceof File)) {
         return NextResponse.json({ error: 'XLSX fayl tanlanmagan.' }, { status: 400 });
       }
       const buf = Buffer.from(await file.arrayBuffer());
-      const wb = new ExcelJS.Workbook();
-      await wb.xlsx.load(buf as unknown as ArrayBuffer);
-      const ws = wb.worksheets[0];
-      if (!ws) {
-        return NextResponse.json({ error: 'Excel varag‘i topilmadi.' }, { status: 400 });
+      const parsed = await parseStudentWorkbookBuffer(buf);
+
+      if (mode === 'commit') {
+        const result = await commitReplaceStudentsTransactional(
+          parsed.rows,
+          file.name || 'StudentList.xlsx',
+          session.displayName
+        );
+        return NextResponse.json(result);
       }
 
-      const parsedRows = parseStudentWorksheet(ws);
-      const res = await bulkImportStudents(parsedRows, session.displayName);
-      return NextResponse.json(res);
+      const preview = previewReplaceStudents(parsed, file.name || 'StudentList.xlsx');
+      return NextResponse.json({ preview });
     }
 
     const body = await req.json();
     const action = String(body?.action ?? '');
 
-    if (action === 'import_attached') {
+    if (action === 'preview_attached') {
       const filePath = path.resolve(process.cwd(), 'public/data/StudentList.xlsx');
       if (!fs.existsSync(filePath)) {
         return NextResponse.json({ error: 'Biriktirilgan StudentList.xlsx fayli topilmadi.' }, { status: 404 });
       }
-      const wb = new ExcelJS.Workbook();
-      await wb.xlsx.readFile(filePath);
-      const ws = wb.worksheets[0];
-      if (!ws) {
-        return NextResponse.json({ error: 'Excel varag‘i topilmadi.' }, { status: 400 });
+      const buf = fs.readFileSync(filePath);
+      const parsed = await parseStudentWorkbookBuffer(buf);
+      const preview = previewReplaceStudents(parsed, 'StudentList.xlsx');
+      return NextResponse.json({ preview });
+    }
+
+    if (action === 'commit_attached' || action === 'import_attached') {
+      const filePath = path.resolve(process.cwd(), 'public/data/StudentList.xlsx');
+      if (!fs.existsSync(filePath)) {
+        return NextResponse.json({ error: 'Biriktirilgan StudentList.xlsx fayli topilmadi.' }, { status: 404 });
       }
-      const parsedRows = parseStudentWorksheet(ws);
-      const res = await bulkImportStudents(parsedRows, session.displayName);
-      return NextResponse.json(res);
+      const buf = fs.readFileSync(filePath);
+      const parsed = await parseStudentWorkbookBuffer(buf);
+      const result = await commitReplaceStudentsTransactional(
+        parsed.rows,
+        'StudentList.xlsx',
+        session.displayName
+      );
+      return NextResponse.json({
+        ...result,
+        imported: result.added + result.reactivated,
+        skipped: result.kept,
+      });
+    }
+
+    if (action === 'commit_replace_rows') {
+      const rows = Array.isArray(body?.rows)
+        ? (body.rows as Array<{ className?: string; fullName?: string }>).map(
+            (r): ParsedStudentRow => ({
+              className: String(r?.className ?? '').trim(),
+              fullName: String(r?.fullName ?? '').trim(),
+            })
+          )
+        : [];
+      const fileName = String(body?.fileName ?? 'StudentList.xlsx').slice(0, 160);
+      const result = await commitReplaceStudentsTransactional(rows, fileName, session.displayName);
+      return NextResponse.json(result);
+    }
+
+    if (action === 'rollback_last') {
+      const result = await rollbackLastStudentImport(session.displayName);
+      return NextResponse.json(result);
     }
 
     if (action === 'create') {

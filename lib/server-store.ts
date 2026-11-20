@@ -4,6 +4,7 @@ import path from 'node:path';
 import type {
   ActivityLog,
   BookTitle,
+  BorrowerType,
   ImportBatch,
   ImportPreviewResult,
   InventoryIncident,
@@ -12,13 +13,22 @@ import type {
   Loan,
   LoanExtension,
   NotificationItem,
+  ParsedStudentRow,
   PhysicalCopy,
   ReturnCondition,
   ReviewIssueCode,
   SourceInventoryRecord,
   Student,
+  StudentImportBackup,
+  StudentReplacePreview,
+  Teacher,
 } from './types';
 import { addDaysYmd, classifyLoanDeadline, getTodayTashkent, isValidYmd } from './date-utils';
+import {
+  computeStudentRosterDiff,
+  normalizeStudentKey,
+  type ParsedStudentWorkbookResult,
+} from './student-parser';
 
 const DATA_DIR = path.resolve(process.cwd(), '.data');
 const DB_FILE = path.join(DATA_DIR, 'library-store.json');
@@ -42,6 +52,8 @@ function defaultDatabase(): LibraryDatabase {
       updatedAt: now,
     },
     students: [],
+    teachers: [],
+    studentImportBackups: [],
     bookTitles: [],
     physicalCopies: [],
     importBatches: [],
@@ -68,7 +80,10 @@ export function readDb(): LibraryDatabase {
     return initial;
   }
   const raw = fs.readFileSync(DB_FILE, 'utf8');
-  return JSON.parse(raw) as LibraryDatabase;
+  const parsed = JSON.parse(raw) as LibraryDatabase;
+  if (!Array.isArray(parsed.teachers)) parsed.teachers = [];
+  if (!Array.isArray(parsed.studentImportBackups)) parsed.studentImportBackups = [];
+  return parsed;
 }
 
 function writeDbAtomic(db: LibraryDatabase) {
@@ -137,14 +152,43 @@ function addNotification(
   }
 }
 
+export async function recordAuthAuditLog(
+  action: 'LOGIN_SUCCESS' | 'LOGIN_FAILED' | 'LOGIN_LOCKED' | 'LOGOUT',
+  actorName: string,
+  summary: string
+): Promise<void> {
+  await withDbTransaction((db) => {
+    addLog(db, actorName, action, 'auth', actorName, summary);
+  });
+}
+
 function nextCopyCode(db: LibraryDatabase): string {
   const num = db.physicalCopies.length + 1;
   return `SL-${String(num).padStart(5, '0')}`;
 }
 
 function nextStudentCode(db: LibraryDatabase): string {
-  const num = db.students.length + 1;
-  return `OQ-${String(num).padStart(4, '0')}`;
+  let maxCode = 0;
+  for (const s of db.students) {
+    const m = /^(?:STU|OQ)-(\d+)$/.exec(s.internalStudentId);
+    if (m) {
+      const n = Number(m[1]);
+      if (n > maxCode) maxCode = n;
+    }
+  }
+  return `STU-${String(maxCode + 1).padStart(4, '0')}`;
+}
+
+function nextTeacherCode(db: LibraryDatabase): string {
+  let maxCode = 0;
+  for (const t of db.teachers) {
+    const m = /^TCH-(\d+)$/.exec(t.internalTeacherId);
+    if (m) {
+      const n = Number(m[1]);
+      if (n > maxCode) maxCode = n;
+    }
+  }
+  return `TCH-${String(maxCode + 1).padStart(4, '0')}`;
 }
 
 /**
@@ -752,82 +796,332 @@ export async function updateStudent(
   });
 }
 
-export async function bulkImportStudents(
-  rows: Array<{ fullName: string; className: string; schoolStudentNumber?: string }>,
+export function previewReplaceStudents(
+  parsed: ParsedStudentWorkbookResult,
+  fileName: string
+): StudentReplacePreview {
+  const db = readDb();
+  return computeStudentRosterDiff(db.students, parsed, db.loans, fileName);
+}
+
+/**
+ * Atomically replaces the active student roster with the incoming list:
+ * - Saves a rollback snapshot of the previous student roster
+ * - Keeps matching active students with their original IDs & loan history intact
+ * - Reactivates matching archived students without creating duplicates
+ * - Archives previously active students missing from the new file (NEVER deletes them or their loans)
+ * - Adds genuinely new students cleanly with ONLY className + fullName
+ */
+export async function commitReplaceStudentsTransactional(
+  rows: ParsedStudentRow[],
+  fileName: string,
   actorName: string
-): Promise<{ imported: number; skipped: number }> {
+): Promise<{
+  added: number;
+  kept: number;
+  reactivated: number;
+  archived: number;
+  activeTotal: number;
+  backupId: string;
+}> {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw new Error('Yangilash uchun kamida bitta haqiqiy o‘quvchi yozuvi bo‘lishi kerak.');
+  }
+
   return withDbTransaction((db) => {
     const now = new Date().toISOString();
     const today = getTodayTashkent();
-    let imported = 0;
-    let skipped = 0;
 
-    const existingKeys = new Set<string>(
-      db.students
-        .filter((s) => s.status === 'active')
-        .map((s) => `${s.className.trim().toLowerCase()}::${s.fullName.trim().toLowerCase()}`)
-    );
+    // Save deep snapshot for one-click rollback
+    const previousStudentsSnapshot: Student[] = db.students.map((s) => ({ ...s }));
+
+    // Deduplicate incoming rows defensively
+    const dedupedRows: ParsedStudentRow[] = [];
+    const incomingSeen = new Set<string>();
+    for (const r of rows) {
+      const className = String(r.className ?? '').trim().replace(/\s+/g, ' ');
+      const fullName = String(r.fullName ?? '').trim().replace(/\s+/g, ' ');
+      if (!className || !fullName) continue;
+      const key = normalizeStudentKey(className, fullName);
+      if (incomingSeen.has(key)) continue;
+      incomingSeen.add(key);
+      dedupedRows.push({ className, fullName });
+    }
+
+    if (dedupedRows.length === 0) {
+      throw new Error('Faylda haqiqiy o‘quvchi yozuvlari topilmadi.');
+    }
+
+    const existingByKey = new Map<string, Student>();
+    for (const s of db.students) {
+      const key = normalizeStudentKey(s.className, s.fullName);
+      const prev = existingByKey.get(key);
+      if (!prev || (prev.status === 'archived' && s.status === 'active')) {
+        existingByKey.set(key, s);
+      }
+    }
 
     let maxCode = 0;
     for (const s of db.students) {
-      const m = /^STU-(\d+)$/.exec(s.internalStudentId);
+      const m = /^(?:STU|OQ)-(\d+)$/.exec(s.internalStudentId);
       if (m) {
         const n = Number(m[1]);
         if (n > maxCode) maxCode = n;
       }
     }
 
-    for (const r of rows) {
-      const fullName = r.fullName.trim();
-      const className = r.className.trim();
-      if (!fullName || !className) {
-        skipped++;
-        continue;
+    const matchedIds = new Set<string>();
+    let added = 0;
+    let kept = 0;
+    let reactivated = 0;
+    let archived = 0;
+
+    for (const row of dedupedRows) {
+      const key = normalizeStudentKey(row.className, row.fullName);
+      const existing = existingByKey.get(key);
+      if (existing) {
+        matchedIds.add(existing.id);
+        // Preserve exact formatting from latest school roster while keeping ID & loan history
+        existing.className = row.className;
+        existing.fullName = row.fullName;
+        if (existing.status === 'archived') {
+          existing.status = 'active';
+          existing.updatedAt = now;
+          reactivated++;
+        } else {
+          kept++;
+        }
+      } else {
+        maxCode += 1;
+        const created: Student = {
+          id: uid('stu'),
+          internalStudentId: `STU-${String(maxCode).padStart(4, '0')}`,
+          schoolStudentNumber: '',
+          fullName: row.fullName,
+          className: row.className,
+          registeredAt: today,
+          status: 'active',
+          notes: '',
+          createdAt: now,
+          updatedAt: now,
+        };
+        db.students.push(created);
+        matchedIds.add(created.id);
+        added++;
       }
-      const key = `${className.toLowerCase()}::${fullName.toLowerCase()}`;
-      if (existingKeys.has(key)) {
-        skipped++;
-        continue;
-      }
-      existingKeys.add(key);
-      maxCode += 1;
-      db.students.push({
-        id: uid('stu'),
-        internalStudentId: `STU-${String(maxCode).padStart(4, '0')}`,
-        schoolStudentNumber: r.schoolStudentNumber?.trim() ?? '',
-        fullName,
-        className,
-        registeredAt: today,
-        status: 'active',
-        notes: 'XLSX orqali import qilingan',
-        createdAt: now,
-        updatedAt: now,
-      });
-      imported++;
     }
 
-    if (imported > 0) {
-      addLog(
-        db,
-        actorName,
-        'IMPORT_STUDENTS',
-        'student',
-        'batch',
-        `${imported} nafar o‘quvchi XLSX fayldan import qilindi (${skipped} ta takroriy o‘tkazib yuborildi).`
-      );
+    // Archive existing active students not present in the new file (NEVER delete!)
+    for (const s of db.students) {
+      if (s.status === 'active' && !matchedIds.has(s.id)) {
+        s.status = 'archived';
+        s.updatedAt = now;
+        archived++;
+      }
     }
 
-    return { imported, skipped };
+    const backupId = uid('sbkp');
+    const backup: StudentImportBackup = {
+      id: backupId,
+      fileName,
+      createdAt: now,
+      actorName,
+      previousStudents: previousStudentsSnapshot,
+      summary: {
+        totalInFile: dedupedRows.length,
+        added,
+        kept,
+        reactivated,
+        archived,
+      },
+    };
+    if (!Array.isArray(db.studentImportBackups)) db.studentImportBackups = [];
+    db.studentImportBackups.unshift(backup);
+    if (db.studentImportBackups.length > 5) {
+      db.studentImportBackups = db.studentImportBackups.slice(0, 5);
+    }
+
+    const activeTotal = db.students.filter((s) => s.status === 'active').length;
+
+    addLog(
+      db,
+      actorName,
+      'REPLACE_STUDENTS',
+      'student',
+      backupId,
+      `O‘quvchilar bazasi (${fileName}) bilan yangilandi: +${added} yangi, ${kept} saqlandi, ${reactivated} qayta faollashdi, ${archived} arxivlandi. Jami faol: ${activeTotal}.`
+    );
+
+    return { added, kept, reactivated, archived, activeTotal, backupId };
   });
 }
 
 /**
- * Atomically issues one or more confirmed available physical copies to a student.
+ * Restores the previous student roster from the latest backup snapshot without deleting any loans.
+ * Any students created after the backup that have loans are safely kept as archived rather than deleted.
+ */
+export async function rollbackLastStudentImport(
+  actorName: string
+): Promise<{ restoredActiveCount: number; rolledBackFileName: string }> {
+  return withDbTransaction((db) => {
+    const backups = db.studentImportBackups ?? [];
+    const latest = backups.shift();
+    if (!latest) {
+      throw new Error('Qayta tiklash uchun avvalgi import zaxirasi topilmadi.');
+    }
+
+    const now = new Date().toISOString();
+    const prevById = new Map(latest.previousStudents.map((s) => [s.id, s]));
+    const loanStudentIds = new Set(db.loans.map((l) => l.studentId).filter(Boolean) as string[]);
+
+    const restored: Student[] = latest.previousStudents.map((s) => ({ ...s, updatedAt: now }));
+
+    // Preserve any newly-added student who already received a loan since the import (archive instead of delete)
+    for (const current of db.students) {
+      if (!prevById.has(current.id) && loanStudentIds.has(current.id)) {
+        restored.push({ ...current, status: 'archived', updatedAt: now });
+      }
+    }
+
+    db.students = restored;
+    db.studentImportBackups = backups;
+
+    const restoredActiveCount = db.students.filter((s) => s.status === 'active').length;
+
+    addLog(
+      db,
+      actorName,
+      'ROLLBACK_STUDENTS',
+      'student',
+      latest.id,
+      `Oxirgi o‘quvchilar importi (${latest.fileName}) bekor qilindi. Avvalgi holat tiklandi (${restoredActiveCount} nafar faol o‘quvchi).`
+    );
+
+    return { restoredActiveCount, rolledBackFileName: latest.fileName };
+  });
+}
+
+export async function bulkImportStudents(
+  rows: Array<{ fullName: string; className: string; schoolStudentNumber?: string }>,
+  actorName: string
+): Promise<{ imported: number; skipped: number }> {
+  const res = await commitReplaceStudentsTransactional(
+    rows.map((r) => ({ className: r.className, fullName: r.fullName })),
+    'StudentList.xlsx',
+    actorName
+  );
+  return { imported: res.added + res.reactivated, skipped: res.kept };
+}
+
+// ============================================================================
+// Teachers CRUD
+// ============================================================================
+
+export async function createTeacher(
+  input: { fullName: string; position: string; notes?: string },
+  actorName: string
+): Promise<Teacher> {
+  const fullName = input.fullName.trim().replace(/\s+/g, ' ');
+  const position = input.position.trim().replace(/\s+/g, ' ');
+  if (fullName.length < 2) {
+    throw new Error('O‘qituvchi F.I.Sh. kamida 2 ta belgidan iborat bo‘lishi kerak.');
+  }
+  if (position.length < 2) {
+    throw new Error('O‘qituvchi lavozimi kiritilishi shart.');
+  }
+
+  return withDbTransaction((db) => {
+    const dup = db.teachers.find(
+      (t) =>
+        t.status === 'active' &&
+        t.fullName.toLowerCase() === fullName.toLowerCase() &&
+        t.position.toLowerCase() === position.toLowerCase()
+    );
+    if (dup) {
+      throw new Error('Bu F.I.Sh. va lavozimdagi o‘qituvchi allaqachon mavjud.');
+    }
+
+    const now = new Date().toISOString();
+    const teacher: Teacher = {
+      id: uid('tch'),
+      internalTeacherId: nextTeacherCode(db),
+      fullName,
+      position,
+      registeredAt: getTodayTashkent(),
+      status: 'active',
+      notes: input.notes?.trim() ?? '',
+      createdAt: now,
+      updatedAt: now,
+    };
+    db.teachers.unshift(teacher);
+
+    addLog(
+      db,
+      actorName,
+      'CREATE_TEACHER',
+      'teacher',
+      teacher.id,
+      `Yangi o‘qituvchi qo‘shildi: ${teacher.fullName} (${teacher.position}).`
+    );
+
+    return teacher;
+  });
+}
+
+export async function updateTeacher(
+  teacherId: string,
+  patch: {
+    fullName?: string;
+    position?: string;
+    status?: 'active' | 'archived';
+    notes?: string;
+  },
+  actorName: string
+): Promise<Teacher> {
+  return withDbTransaction((db) => {
+    const teacher = db.teachers.find((t) => t.id === teacherId);
+    if (!teacher) throw new Error('O‘qituvchi topilmadi.');
+
+    if (patch.status === 'archived') {
+      const hasActiveLoans = db.loans.some(
+        (l) => l.status === 'active' && l.borrowerType === 'teacher' && l.teacherId === teacher.id
+      );
+      if (hasActiveLoans) {
+        throw new Error('Qo‘lida qaytarilmagan kitobi bor o‘qituvchini arxivlab bo‘lmaydi.');
+      }
+    }
+
+    if (patch.fullName !== undefined && patch.fullName.trim().length >= 2) {
+      teacher.fullName = patch.fullName.trim().replace(/\s+/g, ' ');
+    }
+    if (patch.position !== undefined && patch.position.trim().length >= 2) {
+      teacher.position = patch.position.trim().replace(/\s+/g, ' ');
+    }
+    if (patch.status !== undefined) teacher.status = patch.status;
+    if (patch.notes !== undefined) teacher.notes = patch.notes.trim();
+    teacher.updatedAt = new Date().toISOString();
+
+    addLog(
+      db,
+      actorName,
+      'UPDATE_TEACHER',
+      'teacher',
+      teacher.id,
+      `O‘qituvchi ma’lumotlari yangilandi: ${teacher.fullName} (${teacher.position}).`
+    );
+    return teacher;
+  });
+}
+
+/**
+ * Atomically issues one or more confirmed available physical copies to a student OR a teacher.
  * Strictly prevents double-issuing and enforces configurable borrowing limits.
  */
 export async function issueLoansTransactional(
   input: {
-    studentId: string;
+    borrowerType?: BorrowerType;
+    studentId?: string;
+    teacherId?: string;
     physicalCopyIds: string[];
     issuedDate?: string;
     dueDate: string;
@@ -847,18 +1141,42 @@ export async function issueLoansTransactional(
     throw new Error('Qaytarish sanasi berilgan sanadan oldin bo‘lishi mumkin emas.');
   }
 
+  const borrowerType: BorrowerType = input.borrowerType === 'teacher' ? 'teacher' : 'student';
+
   return withDbTransaction((db) => {
-    const student = db.students.find((s) => s.id === input.studentId && s.status === 'active');
-    if (!student) throw new Error('Faol o‘quvchi topilmadi.');
+    let borrowerLabel = '';
+    let resolvedStudentId: string | null = null;
+    let resolvedTeacherId: string | null = null;
 
-    const currentActiveCount = db.loans.filter(
-      (l) => l.studentId === student.id && l.status === 'active'
-    ).length;
+    if (borrowerType === 'teacher') {
+      const teacher = db.teachers.find((t) => t.id === input.teacherId && t.status === 'active');
+      if (!teacher) throw new Error('Faol o‘qituvchi topilmadi.');
+      const currentActiveCount = db.loans.filter(
+        (l) => l.borrowerType === 'teacher' && l.teacherId === teacher.id && l.status === 'active'
+      ).length;
+      const teacherMax = Math.max(20, db.settings.maxBooksPerStudent * 3);
+      if (currentActiveCount + uniqueCopyIds.length > teacherMax) {
+        throw new Error(
+          `O‘qituvchi bir vaqtda ko‘pi bilan ${teacherMax} ta kitob olishi mumkin (hozir qo‘lida: ${currentActiveCount} ta).`
+        );
+      }
+      resolvedTeacherId = teacher.id;
+      borrowerLabel = `${teacher.fullName} (O‘qituvchi · ${teacher.position})`;
+    } else {
+      const student = db.students.find((s) => s.id === input.studentId && s.status === 'active');
+      if (!student) throw new Error('Faol o‘quvchi topilmadi.');
 
-    if (currentActiveCount + uniqueCopyIds.length > db.settings.maxBooksPerStudent) {
-      throw new Error(
-        `O‘quvchi bir vaqtda ko‘pi bilan ${db.settings.maxBooksPerStudent} ta kitob olishi mumkin (hozir qo‘lida: ${currentActiveCount} ta).`
-      );
+      const currentActiveCount = db.loans.filter(
+        (l) => (l.borrowerType ?? 'student') === 'student' && l.studentId === student.id && l.status === 'active'
+      ).length;
+
+      if (currentActiveCount + uniqueCopyIds.length > db.settings.maxBooksPerStudent) {
+        throw new Error(
+          `O‘quvchi bir vaqtda ko‘pi bilan ${db.settings.maxBooksPerStudent} ta kitob olishi mumkin (hozir qo‘lida: ${currentActiveCount} ta).`
+        );
+      }
+      resolvedStudentId = student.id;
+      borrowerLabel = `${student.fullName} (${student.className})`;
     }
 
     // Validate EVERY copy before mutating anything (atomic all-or-nothing!)
@@ -874,7 +1192,7 @@ export async function issueLoansTransactional(
       }
       const existingActive = db.loans.find((l) => l.physicalCopyId === copy.id && l.status === 'active');
       if (existingActive) {
-        throw new Error(`Nusxa (${copy.internalCopyCode}) allaqachon boshqa o‘quvchiga berilgan!`);
+        throw new Error(`Nusxa (${copy.internalCopyCode}) allaqachon boshqa foydalanuvchiga berilgan!`);
       }
       const book = db.bookTitles.find((b) => b.id === copy.bookTitleId);
       if (!book) throw new Error('Nusxaga bog‘langan kitob topilmadi.');
@@ -888,7 +1206,9 @@ export async function issueLoansTransactional(
       const loanId = uid('loan');
       const loan: Loan = {
         id: loanId,
-        studentId: student.id,
+        borrowerType,
+        studentId: resolvedStudentId,
+        teacherId: resolvedTeacherId,
         bookTitleId: book.id,
         physicalCopyId: copy.id,
         issuedDate,
@@ -912,7 +1232,7 @@ export async function issueLoansTransactional(
         'ISSUE_BOOK',
         'loan',
         loanId,
-        `${student.fullName} (${student.className}) ga "${book.title}" [${copy.internalCopyCode}] berildi. Qaytarish: ${input.dueDate}.`
+        `${borrowerLabel} ga "${book.title}" [${copy.internalCopyCode}] berildi. Qaytarish: ${input.dueDate}.`
       );
     }
 
@@ -1029,7 +1349,12 @@ export async function returnLoanTransactional(
     const copy = db.physicalCopies.find((c) => c.id === loan.physicalCopyId);
     if (!copy) throw new Error('Bog‘langan fizik nusxa topilmadi.');
 
-    const student = db.students.find((s) => s.id === loan.studentId);
+    const student = loan.studentId ? db.students.find((s) => s.id === loan.studentId) : undefined;
+    const teacher = loan.teacherId ? db.teachers.find((t) => t.id === loan.teacherId) : undefined;
+    const borrowerName =
+      loan.borrowerType === 'teacher'
+        ? teacher?.fullName ?? 'O‘qituvchi'
+        : student?.fullName ?? 'O‘quvchi';
     const book = db.bookTitles.find((b) => b.id === loan.bookTitleId);
     const now = new Date().toISOString();
 
@@ -1055,6 +1380,7 @@ export async function returnLoanTransactional(
         bookTitleId: loan.bookTitleId,
         loanId: loan.id,
         studentId: loan.studentId,
+        teacherId: loan.teacherId ?? null,
         incidentType: input.condition,
         notes: input.notes?.trim() || (input.condition === 'damaged' ? 'Shikastlangan holda qaytarildi' : 'Kitob yo‘qolgan deb qayd etildi'),
         resolved: false,
@@ -1066,7 +1392,7 @@ export async function returnLoanTransactional(
         db,
         'incident',
         input.condition === 'damaged' ? 'Shikastlangan kitob qayd etildi' : 'Yo‘qolgan kitob qayd etildi',
-        `${student?.fullName ?? 'O‘quvchi'} — "${book?.title ?? 'Kitob'}" [${copy.internalCopyCode}]`,
+        `${borrowerName} — "${book?.title ?? 'Kitob'}" [${copy.internalCopyCode}]`,
         '/catalog'
       );
     }
@@ -1084,7 +1410,7 @@ export async function returnLoanTransactional(
       'RETURN_BOOK',
       'loan',
       loan.id,
-      `${student?.fullName ?? 'O‘quvchi'} "${book?.title ?? 'Kitob'}" [${copy.internalCopyCode}] kitobini qaytardi (${condLabel}).`
+      `${borrowerName} "${book?.title ?? 'Kitob'}" [${copy.internalCopyCode}] kitobini qaytardi (${condLabel}).`
     );
 
     return { loan, copy, incident };
@@ -1186,6 +1512,7 @@ export function computeSmartNotifications(db: LibraryDatabase): NotificationItem
   const today = getTodayTashkent();
   const dynamic: NotificationItem[] = [];
   const studentMap = new Map(db.students.map((s) => [s.id, s]));
+  const teacherMap = new Map((db.teachers ?? []).map((t) => [t.id, t]));
   const bookMap = new Map(db.bookTitles.map((b) => [b.id, b]));
 
   const activeLoans = db.loans.filter((l) => l.status === 'active');
@@ -1198,11 +1525,15 @@ export function computeSmartNotifications(db: LibraryDatabase): NotificationItem
 
   if (overdue.length > 0) {
     const first = overdue[0];
+    const borrowerName =
+      first.borrowerType === 'teacher'
+        ? (first.teacherId ? teacherMap.get(first.teacherId)?.fullName : undefined) ?? 'O‘qituvchi'
+        : (first.studentId ? studentMap.get(first.studentId)?.fullName : undefined) ?? 'O‘quvchi';
     dynamic.push({
       id: `dyn_overdue_${today}`,
       type: 'overdue',
       title: `${overdue.length} ta kitobning muddati o‘tgan`,
-      message: `${studentMap.get(first.studentId)?.fullName ?? 'O‘quvchi'} — "${bookMap.get(first.bookTitleId)?.title ?? 'Kitob'}" va boshqalar.`,
+      message: `${borrowerName} — "${bookMap.get(first.bookTitleId)?.title ?? 'Kitob'}" va boshqalar.`,
       read: false,
       link: '/deadlines',
       createdAt: new Date().toISOString(),
@@ -1224,7 +1555,7 @@ export function computeSmartNotifications(db: LibraryDatabase): NotificationItem
       id: `dyn_soon_${today}`,
       type: 'upcoming',
       title: `Yaqin 3 kunda ${dueSoon.length} ta qaytarish kutilmoqda`,
-      message: `O‘quvchilarga eslatma berish uchun muddatlar jadvalini tekshiring.`,
+      message: `O‘quvchi va o‘qituvchilarga eslatma berish uchun muddatlar jadvalini tekshiring.`,
       read: false,
       link: '/deadlines',
       createdAt: new Date().toISOString(),
@@ -1242,7 +1573,11 @@ export function buildDashboardSummary(db: LibraryDatabase) {
   const activeLoans = db.loans.filter((l) => l.status === 'active');
   const dueToday = activeLoans.filter((l) => classifyLoanDeadline(l, today).bucket === 'due_today');
   const overdue = activeLoans.filter((l) => classifyLoanDeadline(l, today).bucket === 'overdue');
-  const activeStudentsWithLoans = new Set(activeLoans.map((l) => l.studentId));
+  const activeBorrowers = new Set(
+    activeLoans.map((l) =>
+      l.borrowerType === 'teacher' ? `tch:${l.teacherId ?? ''}` : `stu:${l.studentId ?? ''}`
+    )
+  );
   const booksNeedingReview = db.bookTitles.filter((b) => b.reviewStatus === 'needs_review');
 
   // 14-day daily issue/return activity chart from REAL loans
@@ -1285,10 +1620,11 @@ export function buildDashboardSummary(db: LibraryDatabase) {
       issuedCopies: issuedCopies.length,
       dueTodayCount: dueToday.length,
       overdueCount: overdue.length,
-      activeBorrowersCount: activeStudentsWithLoans.size,
+      activeBorrowersCount: activeBorrowers.size,
       totalCatalogRecords: db.bookTitles.filter((b) => b.reviewStatus !== 'archived').length,
       needsReviewCount: booksNeedingReview.length,
       totalStudents: db.students.filter((s) => s.status === 'active').length,
+      totalTeachers: (db.teachers ?? []).filter((t) => t.status === 'active').length,
     },
     dueTodayLoans: dueToday.slice(0, 10),
     overdueLoans: overdue.slice(0, 10),

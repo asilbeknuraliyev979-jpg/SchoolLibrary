@@ -34,6 +34,23 @@
       },
       "required": ["ownerUid", "internalStudentId", "fullName", "className", "registeredAt", "status", "createdAt", "updatedAt"]
     },
+    "Teacher": {
+      "title": "Teacher",
+      "description": "Registered school teacher borrower record",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "internalTeacherId": { "type": "string", "minLength": 2, "maxLength": 64 },
+        "fullName": { "type": "string", "minLength": 2, "maxLength": 160 },
+        "position": { "type": "string", "minLength": 2, "maxLength": 160 },
+        "registeredAt": { "type": "string", "minLength": 8, "maxLength": 32 },
+        "status": { "type": "string", "enum": ["active", "archived"] },
+        "notes": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "internalTeacherId", "fullName", "position", "registeredAt", "status", "createdAt", "updatedAt"]
+    },
     "BookTitle": {
       "title": "BookTitle",
       "description": "Normalized catalog title record linked to source inventory",
@@ -121,11 +138,13 @@
     },
     "Loan": {
       "title": "Loan",
-      "description": "Active or completed student book loan",
+      "description": "Active or completed student or teacher book loan",
       "type": "object",
       "properties": {
         "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "borrowerType": { "type": "string", "enum": ["student", "teacher"] },
         "studentId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "teacherId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "bookTitleId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "physicalCopyId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "issuedDate": { "type": "string", "minLength": 10, "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
@@ -137,7 +156,7 @@
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
-      "required": ["ownerUid", "studentId", "bookTitleId", "physicalCopyId", "issuedDate", "dueDate", "status", "createdAt", "updatedAt"]
+      "required": ["ownerUid", "borrowerType", "bookTitleId", "physicalCopyId", "issuedDate", "dueDate", "status", "createdAt", "updatedAt"]
     },
     "LoanExtension": {
       "title": "LoanExtension",
@@ -223,6 +242,10 @@
     "/students/{studentId}": {
       "schema": { "$ref": "#/entities/Student" },
       "description": "Student registry records"
+    },
+    "/teachers/{teacherId}": {
+      "schema": { "$ref": "#/entities/Teacher" },
+      "description": "Teacher registry records"
     },
     "/book_titles/{bookId}": {
       "schema": { "$ref": "#/entities/BookTitle" },

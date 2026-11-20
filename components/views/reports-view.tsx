@@ -48,7 +48,7 @@ export function ReportsView() {
       if (fromDate && l.issuedDate < fromDate) return false;
       if (toDate && l.issuedDate > toDate) return false;
       if (classFilter !== 'all') {
-        const st = studentMap.get(l.studentId);
+        const st = l.studentId ? studentMap.get(l.studentId) : undefined;
         if (st?.className !== classFilter) return false;
       }
       return true;
@@ -114,7 +114,10 @@ export function ReportsView() {
   const classActivity = useMemo(() => {
     const counts = new Map<string, number>();
     for (const l of filteredLoans) {
-      const cls = studentMap.get(l.studentId)?.className || 'Noma’lum';
+      const cls =
+        l.borrowerType === 'teacher'
+          ? 'O‘qituvchilar'
+          : (l.studentId ? studentMap.get(l.studentId)?.className : undefined) || 'Noma’lum';
       counts.set(cls, (counts.get(cls) ?? 0) + 1);
     }
     return Array.from(counts.entries())

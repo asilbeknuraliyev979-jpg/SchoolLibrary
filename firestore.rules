@@ -66,6 +66,21 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    function isValidTeacher(data) {
+      return data.keys().hasAll(['ownerUid', 'internalTeacherId', 'fullName', 'position', 'registeredAt', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerUid', 'internalTeacherId', 'fullName', 'position', 'registeredAt', 'status', 'notes', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerUid)
+        && data.ownerUid == request.auth.uid
+        && data.internalTeacherId is string && data.internalTeacherId.size() >= 2 && data.internalTeacherId.size() <= 64
+        && data.fullName is string && data.fullName.size() >= 2 && data.fullName.size() <= 160
+        && data.position is string && data.position.size() >= 2 && data.position.size() <= 160
+        && data.registeredAt is string && data.registeredAt.size() >= 8 && data.registeredAt.size() <= 32
+        && data.status in ['active', 'archived']
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 500))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     function isValidBookTitle(data) {
       return data.keys().hasAll(['ownerUid', 'title', 'reviewStatus', 'isRangeRecord', 'rangeConfirmed', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly(['ownerUid', 'title', 'author', 'originalAuthorTitle', 'inventoryNumberRaw', 'publicationYearRaw', 'publicationYear', 'departmentCode', 'priceRaw', 'reviewStatus', 'reviewIssues', 'sourceRecordId', 'sourceRowNumber', 'isRangeRecord', 'rangeConfirmed', 'createdAt', 'updatedAt'])
@@ -144,11 +159,15 @@ service cloud.firestore {
     }
 
     function isValidLoan(data) {
-      return data.keys().hasAll(['ownerUid', 'studentId', 'bookTitleId', 'physicalCopyId', 'issuedDate', 'dueDate', 'status', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['ownerUid', 'studentId', 'bookTitleId', 'physicalCopyId', 'issuedDate', 'dueDate', 'returnedDate', 'status', 'returnCondition', 'notes', 'createdAt', 'updatedAt'])
+      return data.keys().hasAll(['ownerUid', 'borrowerType', 'bookTitleId', 'physicalCopyId', 'issuedDate', 'dueDate', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerUid', 'borrowerType', 'studentId', 'teacherId', 'bookTitleId', 'physicalCopyId', 'issuedDate', 'dueDate', 'returnedDate', 'status', 'returnCondition', 'notes', 'createdAt', 'updatedAt'])
         && isValidId(data.ownerUid)
         && data.ownerUid == request.auth.uid
-        && isValidId(data.studentId)
+        && data.borrowerType in ['student', 'teacher']
+        && (
+          (data.borrowerType == 'student' && 'studentId' in data && isValidId(data.studentId) && (!('teacherId' in data) || data.teacherId == null)) ||
+          (data.borrowerType == 'teacher' && 'teacherId' in data && isValidId(data.teacherId) && (!('studentId' in data) || data.studentId == null))
+        )
         && isValidId(data.bookTitleId)
         && isValidId(data.physicalCopyId)
         && isDateYmd(data.issuedDate)
@@ -175,12 +194,13 @@ service cloud.firestore {
 
     function isValidInventoryIncident(data) {
       return data.keys().hasAll(['ownerUid', 'physicalCopyId', 'incidentType', 'resolved', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['ownerUid', 'physicalCopyId', 'loanId', 'studentId', 'incidentType', 'notes', 'resolved', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerUid', 'physicalCopyId', 'loanId', 'studentId', 'teacherId', 'incidentType', 'notes', 'resolved', 'createdAt', 'updatedAt'])
         && isValidId(data.ownerUid)
         && data.ownerUid == request.auth.uid
         && isValidId(data.physicalCopyId)
         && (!('loanId' in data) || data.loanId == null || isValidId(data.loanId))
         && (!('studentId' in data) || data.studentId == null || isValidId(data.studentId))
+        && (!('teacherId' in data) || data.teacherId == null || isValidId(data.teacherId))
         && data.incidentType in ['damaged', 'lost']
         && (!('notes' in data) || (data.notes is string && data.notes.size() <= 500))
         && data.resolved is bool
@@ -275,6 +295,27 @@ service cloud.firestore {
       allow delete: if isAdmin() && isValidId(studentId);
     }
 
+    match /teachers/{teacherId} {
+      allow get: if isSignedIn() && isValidId(teacherId) && (isOwner(existing()) || isAdmin());
+      allow list: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isSignedIn()
+        && isValidId(teacherId)
+        && isValidTeacher(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isSignedIn()
+        && isValidId(teacherId)
+        && isValidTeacher(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          (isOwner(existing()) && incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'position', 'status', 'notes', 'updatedAt']))
+        );
+      allow delete: if isAdmin() && isValidId(teacherId);
+    }
+
     match /book_titles/{bookId} {
       allow get: if isSignedIn() && isValidId(bookId) && (isOwner(existing()) || isAdmin());
       allow list: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
@@ -365,14 +406,17 @@ service cloud.firestore {
         && incoming().status == 'active'
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time
-        && get(/databases/$(database)/documents/students/$(incoming().studentId)).data.ownerUid == request.auth.uid
+        && (
+          (incoming().borrowerType == 'student' && get(/databases/$(database)/documents/students/$(incoming().studentId)).data.ownerUid == request.auth.uid) ||
+          (incoming().borrowerType == 'teacher' && get(/databases/$(database)/documents/teachers/$(incoming().teacherId)).data.ownerUid == request.auth.uid)
+        )
         && get(/databases/$(database)/documents/book_titles/$(incoming().bookTitleId)).data.ownerUid == request.auth.uid
         && get(/databases/$(database)/documents/physical_copies/$(incoming().physicalCopyId)).data.ownerUid == request.auth.uid;
       allow update: if isSignedIn()
         && isValidId(loanId)
         && isValidLoan(incoming())
         && incoming().ownerUid == existing().ownerUid
-        && incoming().studentId == existing().studentId
+        && incoming().borrowerType == existing().borrowerType
         && incoming().bookTitleId == existing().bookTitleId
         && incoming().physicalCopyId == existing().physicalCopyId
         && incoming().issuedDate == existing().issuedDate

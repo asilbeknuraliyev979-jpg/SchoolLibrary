@@ -18,6 +18,8 @@ import type {
   PhysicalCopy,
   SourceInventoryRecord,
   Student,
+  StudentImportBackup,
+  Teacher,
 } from '@/lib/types';
 
 export interface DashboardPayload {
@@ -32,6 +34,7 @@ export interface DashboardPayload {
     totalCatalogRecords: number;
     needsReviewCount: number;
     totalStudents: number;
+    totalTeachers?: number;
   };
   dueTodayLoans: Loan[];
   overdueLoans: Loan[];
@@ -41,12 +44,16 @@ export interface DashboardPayload {
   reviewSample: BookTitle[];
 }
 
+export type StudentImportBackupMeta = Omit<StudentImportBackup, 'previousStudents'>;
+
 export interface LibraryStatePayload {
   user: LibrarianProfile;
   settings: LibrarySettings;
   dashboard: DashboardPayload;
   notifications: NotificationItem[];
   students: Student[];
+  teachers: Teacher[];
+  studentImportBackups: StudentImportBackupMeta[];
   bookTitles: BookTitle[];
   physicalCopies: PhysicalCopy[];
   importBatches: ImportBatch[];

@@ -6,6 +6,7 @@ import { toast } from 'sonner';
 import { useLibrary } from '@/components/library-context';
 import { Button, Input, PanelCard, SelectField, StatusText } from '@/components/ui/primitives';
 import { authFetch } from '@/lib/api-client';
+import { resolveLoanBorrower } from '@/lib/borrower-utils';
 import { classifyLoanDeadline, formatYmdDisplay, getTodayTashkent } from '@/lib/date-utils';
 import { compareClassNames } from '@/lib/utils';
 
@@ -20,6 +21,10 @@ export function ReturnsView() {
   const studentMap = useMemo(
     () => new Map((data?.students ?? []).map((s) => [s.id, s])),
     [data?.students]
+  );
+  const teacherMap = useMemo(
+    () => new Map((data?.teachers ?? []).map((t) => [t.id, t])),
+    [data?.teachers]
   );
   const bookMap = useMemo(
     () => new Map((data?.bookTitles ?? []).map((b) => [b.id, b])),
@@ -43,18 +48,22 @@ export function ReturnsView() {
     return (data?.loans ?? [])
       .filter((l) => l.status === 'active')
       .map((loan) => {
-        const student = studentMap.get(loan.studentId);
+        const borrower = resolveLoanBorrower(loan, studentMap, teacherMap);
         const book = bookMap.get(loan.bookTitleId);
         const copy = copyMap.get(loan.physicalCopyId);
         const dl = classifyLoanDeadline(loan, today);
-        return { loan, student, book, copy, dl };
+        return { loan, borrower, book, copy, dl };
       })
-      .filter(({ student, book, copy }) => {
-        if (classFilter && student?.className !== classFilter) return false;
+      .filter(({ borrower, book, copy }) => {
+        if (classFilter === '__teachers__' && borrower.type !== 'teacher') return false;
+        if (classFilter && classFilter !== '__teachers__' && (borrower.type !== 'student' || borrower.groupLabel !== classFilter)) {
+          return false;
+        }
         if (!q) return true;
         const hay = [
-          student?.fullName,
-          student?.className,
+          borrower.fullName,
+          borrower.groupLabel,
+          borrower.typeLabel,
           book?.title,
           book?.author,
           copy?.originalInventoryNumber,
@@ -65,7 +74,7 @@ export function ReturnsView() {
         return hay.includes(q);
       })
       .sort((a, b) => a.loan.dueDate.localeCompare(b.loan.dueDate));
-  }, [bookMap, classFilter, copyMap, data?.loans, search, studentMap, today]);
+  }, [bookMap, classFilter, copyMap, data?.loans, search, studentMap, teacherMap, today]);
 
   if (!data) {
     return <p className="text-xs text-[#64748B]">Ma’lumotlar yuklanmoqda...</p>;
@@ -98,10 +107,11 @@ export function ReturnsView() {
     void downloadTableXlsx({
       fileName: `Qaytarilishi_kerak_${today}.xlsx`,
       sheetName: 'Qaytarish',
-      headers: ['Sinf', 'O‘quvchi', 'Kitob nomi', 'Inventar №', 'Berilgan sana', 'Qaytarish sanasi', 'Holat'],
-      rows: activeRows.map(({ loan, student, book, copy, dl }) => [
-        student?.className ?? '—',
-        student?.fullName ?? '—',
+      headers: ['Turi', 'Sinf / Lavozim', 'F.I.Sh.', 'Kitob nomi', 'Inventar №', 'Berilgan sana', 'Qaytarish sanasi', 'Holat'],
+      rows: activeRows.map(({ loan, borrower, book, copy, dl }) => [
+        borrower.typeLabel,
+        borrower.groupLabel,
+        borrower.fullName,
         book?.title ?? '—',
         copy?.originalInventoryNumber || copy?.internalCopyCode || '—',
         formatYmdDisplay(loan.issuedDate),
@@ -112,7 +122,7 @@ export function ReturnsView() {
             ? 'Bugun'
             : 'Faol',
       ]),
-      columnWidths: [10, 32, 38, 16, 15, 16, 18],
+      columnWidths: [14, 22, 32, 38, 16, 15, 16, 18],
     });
   }
 
@@ -126,18 +136,19 @@ export function ReturnsView() {
             <Input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="O‘quvchi, sinf yoki kitob..."
+              placeholder="O‘quvchi, o‘qituvchi yoki kitob..."
               aria-label="Qaytariladigan kitoblarni qidirish"
               className="pl-8"
             />
           </div>
           <SelectField
-            aria-label="Sinf bo‘yicha filtr"
+            aria-label="Sinf yoki guruh bo‘yicha filtr"
             value={classFilter}
             onChange={(e) => setClassFilter(e.target.value)}
             className="w-full sm:w-40"
           >
-            <option value="">Barcha sinflar</option>
+            <option value="">Barchasi</option>
+            <option value="__teachers__">O‘qituvchilar</option>
             {classes.map((c) => (
               <option key={c} value={c}>
                 {c}
@@ -158,8 +169,8 @@ export function ReturnsView() {
           <table className="w-full text-left border-collapse">
             <thead>
               <tr className="bg-[#1E3A5F] text-white text-xs font-medium">
-                <th className="py-2.5 px-4 whitespace-nowrap">Sinf</th>
-                <th className="py-2.5 px-4 whitespace-nowrap">O‘quvchi</th>
+                <th className="py-2.5 px-4 whitespace-nowrap">Sinf / Lavozim</th>
+                <th className="py-2.5 px-4 whitespace-nowrap">O‘quvchi / O‘qituvchi</th>
                 <th className="py-2.5 px-4 whitespace-nowrap">Kitob</th>
                 <th className="py-2.5 px-4 whitespace-nowrap">Inventar №</th>
                 <th className="py-2.5 px-4 whitespace-nowrap">Berilgan</th>
@@ -176,46 +187,63 @@ export function ReturnsView() {
                   </td>
                 </tr>
               ) : (
-                activeRows.map(({ loan, student, book, copy, dl }) => (
-                  <tr key={loan.id} className="hover:bg-[#F8FAFC]">
-                    <td className="py-2.5 px-4 font-medium text-[#1E3A5F] whitespace-nowrap">
-                      {student?.className ?? '—'}
-                    </td>
-                    <td className="py-2.5 px-4 text-[#0F172A]">{student?.fullName ?? '—'}</td>
-                    <td className="py-2.5 px-4 text-[#334155] max-w-[280px] truncate">
-                      {book?.title ?? '—'}
-                    </td>
-                    <td className="py-2.5 px-4 font-mono text-xs text-[#64748B] whitespace-nowrap">
-                      {copy?.originalInventoryNumber || copy?.internalCopyCode || '—'}
-                    </td>
-                    <td className="py-2.5 px-4 text-xs text-[#64748B] tabular-nums whitespace-nowrap">
-                      {formatYmdDisplay(loan.issuedDate)}
-                    </td>
-                    <td className="py-2.5 px-4 text-xs font-medium text-[#0F172A] tabular-nums whitespace-nowrap">
-                      {formatYmdDisplay(loan.dueDate)}
-                    </td>
-                    <td className="py-2.5 px-4 whitespace-nowrap">
-                      {dl.bucket === 'overdue' ? (
-                        <StatusText tone="red">{Math.abs(dl.deltaDays)} kun kechikkan</StatusText>
-                      ) : dl.bucket === 'due_today' ? (
-                        <StatusText tone="amber">Bugun</StatusText>
-                      ) : (
-                        <StatusText tone="blue">Faol</StatusText>
-                      )}
-                    </td>
-                    <td className="py-2.5 px-4 text-right whitespace-nowrap">
-                      <Button
-                        size="sm"
-                        variant="primary"
-                        disabled={busyLoanId === loan.id}
-                        onClick={() => void handleOneClickReturn(loan.id)}
+                activeRows.map(({ loan, borrower, book, copy, dl }) => {
+                  const isOverdue = dl.bucket === 'overdue';
+                  return (
+                    <tr
+                      key={loan.id}
+                      className={
+                        isOverdue ? 'bg-[#FEF2F2]/70 hover:bg-[#FEF2F2]' : 'hover:bg-[#F8FAFC]'
+                      }
+                    >
+                      <td className="py-2.5 px-4 whitespace-nowrap">
+                        <span className="font-medium text-[#1E3A5F]">{borrower.badgeText}</span>
+                        {borrower.type === 'teacher' && (
+                          <div className="text-[11px] text-[#64748B] truncate max-w-[160px]">
+                            {borrower.groupLabel}
+                          </div>
+                        )}
+                      </td>
+                      <td className="py-2.5 px-4 text-[#0F172A]">{borrower.fullName}</td>
+                      <td className="py-2.5 px-4 text-[#334155] max-w-[260px] truncate">
+                        {book?.title ?? '—'}
+                      </td>
+                      <td className="py-2.5 px-4 font-mono text-xs text-[#64748B] whitespace-nowrap">
+                        {copy?.originalInventoryNumber || copy?.internalCopyCode || '—'}
+                      </td>
+                      <td className="py-2.5 px-4 text-xs text-[#64748B] tabular-nums whitespace-nowrap">
+                        {formatYmdDisplay(loan.issuedDate)}
+                      </td>
+                      <td
+                        className={`py-2.5 px-4 text-xs font-medium tabular-nums whitespace-nowrap ${
+                          isOverdue ? 'text-[#DC2626]' : 'text-[#0F172A]'
+                        }`}
                       >
-                        <Check className="w-3.5 h-3.5" />
-                        {busyLoanId === loan.id ? 'Saqlanmoqda...' : 'Qaytarildi'}
-                      </Button>
-                    </td>
-                  </tr>
-                ))
+                        {formatYmdDisplay(loan.dueDate)}
+                      </td>
+                      <td className="py-2.5 px-4 whitespace-nowrap">
+                        {isOverdue ? (
+                          <StatusText tone="red">{Math.abs(dl.deltaDays)} kun kechikkan</StatusText>
+                        ) : dl.bucket === 'due_today' ? (
+                          <StatusText tone="amber">Bugun</StatusText>
+                        ) : (
+                          <StatusText tone="blue">Faol</StatusText>
+                        )}
+                      </td>
+                      <td className="py-2.5 px-4 text-right whitespace-nowrap">
+                        <Button
+                          size="sm"
+                          variant="primary"
+                          disabled={busyLoanId === loan.id}
+                          onClick={() => void handleOneClickReturn(loan.id)}
+                        >
+                          <Check className="w-3.5 h-3.5" />
+                          {busyLoanId === loan.id ? 'Saqlanmoqda...' : 'Qaytarildi'}
+                        </Button>
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>

@@ -21,7 +21,9 @@ export async function POST(req: NextRequest) {
     if (action === 'issue') {
       const loans = await issueLoansTransactional(
         {
-          studentId: String(body.studentId ?? ''),
+          borrowerType: body.borrowerType === 'teacher' ? 'teacher' : 'student',
+          studentId: body.studentId ? String(body.studentId) : undefined,
+          teacherId: body.teacherId ? String(body.teacherId) : undefined,
           physicalCopyIds: Array.isArray(body.physicalCopyIds)
             ? body.physicalCopyIds.map(String)
             : body.physicalCopyId

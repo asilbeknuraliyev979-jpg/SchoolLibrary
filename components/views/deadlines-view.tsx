@@ -6,6 +6,7 @@ import { toast } from 'sonner';
 import { useLibrary } from '@/components/library-context';
 import { Button, Input, PanelCard, SelectField, StatusText } from '@/components/ui/primitives';
 import { authFetch } from '@/lib/api-client';
+import { resolveLoanBorrower } from '@/lib/borrower-utils';
 import { classifyLoanDeadline, formatYmdDisplay, getTodayTashkent } from '@/lib/date-utils';
 import { compareClassNames } from '@/lib/utils';
 
@@ -23,6 +24,10 @@ export function DeadlinesView() {
   const studentMap = useMemo(
     () => new Map((data?.students ?? []).map((s) => [s.id, s])),
     [data?.students]
+  );
+  const teacherMap = useMemo(
+    () => new Map((data?.teachers ?? []).map((t) => [t.id, t])),
+    [data?.teachers]
   );
   const bookMap = useMemo(
     () => new Map((data?.bookTitles ?? []).map((b) => [b.id, b])),
@@ -43,13 +48,13 @@ export function DeadlinesView() {
 
   const enrichedLoans = useMemo(() => {
     return (data?.loans ?? []).map((loan) => {
-      const student = studentMap.get(loan.studentId);
+      const borrower = resolveLoanBorrower(loan, studentMap, teacherMap);
       const book = bookMap.get(loan.bookTitleId);
       const copy = copyMap.get(loan.physicalCopyId);
       const dl = classifyLoanDeadline(loan, today);
-      return { loan, student, book, copy, dl };
+      return { loan, borrower, book, copy, dl };
     });
-  }, [bookMap, copyMap, data?.loans, studentMap, today]);
+  }, [bookMap, copyMap, data?.loans, studentMap, teacherMap, today]);
 
   const counts = useMemo(() => {
     let active = 0;
@@ -69,15 +74,19 @@ export function DeadlinesView() {
   const filteredRows = useMemo(() => {
     const q = search.trim().toLowerCase();
     return enrichedLoans
-      .filter(({ loan, student, book, copy, dl }) => {
+      .filter(({ loan, borrower, book, copy, dl }) => {
         if (tab === 'active' && loan.status !== 'active') return false;
         if (tab === 'overdue' && dl.bucket !== 'overdue') return false;
         if (tab === 'returned' && loan.status !== 'returned') return false;
-        if (classFilter && student?.className !== classFilter) return false;
+        if (classFilter === '__teachers__' && borrower.type !== 'teacher') return false;
+        if (classFilter && classFilter !== '__teachers__' && (borrower.type !== 'student' || borrower.groupLabel !== classFilter)) {
+          return false;
+        }
         if (!q) return true;
         const hay = [
-          student?.fullName,
-          student?.className,
+          borrower.fullName,
+          borrower.groupLabel,
+          borrower.typeLabel,
           book?.title,
           book?.author,
           copy?.originalInventoryNumber,
@@ -121,8 +130,9 @@ export function DeadlinesView() {
       fileName: `Monitoring_${tab}_${today}.xlsx`,
       sheetName: 'Monitoring',
       headers: [
-        'Sinf',
-        'O‘quvchi',
+        'Turi',
+        'Sinf / Lavozim',
+        'F.I.Sh.',
         'Kitob nomi',
         'Inventar №',
         'Berilgan sana',
@@ -130,9 +140,10 @@ export function DeadlinesView() {
         'Qaytarilgan sana',
         'Holat',
       ],
-      rows: filteredRows.map(({ loan, student, book, copy, dl }) => [
-        student?.className ?? '—',
-        student?.fullName ?? '—',
+      rows: filteredRows.map(({ loan, borrower, book, copy, dl }) => [
+        borrower.typeLabel,
+        borrower.groupLabel,
+        borrower.fullName,
         book?.title ?? '—',
         copy?.originalInventoryNumber || copy?.internalCopyCode || '—',
         formatYmdDisplay(loan.issuedDate),
@@ -146,7 +157,7 @@ export function DeadlinesView() {
               ? 'Bugun'
               : 'Faol',
       ]),
-      columnWidths: [10, 32, 38, 16, 15, 16, 16, 18],
+      columnWidths: [14, 22, 32, 38, 16, 15, 16, 16, 18],
     });
   }
 
@@ -190,18 +201,19 @@ export function DeadlinesView() {
             <Input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="O‘quvchi yoki kitob..."
+              placeholder="O‘quvchi, o‘qituvchi, kitob..."
               aria-label="Monitoring qidiruvi"
               className="pl-8"
             />
           </div>
           <SelectField
-            aria-label="Sinf bo‘yicha filtr"
+            aria-label="Sinf yoki guruh bo‘yicha filtr"
             value={classFilter}
             onChange={(e) => setClassFilter(e.target.value)}
-            className="w-full sm:w-36"
+            className="w-full sm:w-40"
           >
-            <option value="">Barcha sinflar</option>
+            <option value="">Barchasi</option>
+            <option value="__teachers__">O‘qituvchilar</option>
             {classes.map((c) => (
               <option key={c} value={c}>
                 {c}
@@ -221,8 +233,8 @@ export function DeadlinesView() {
           <table className="w-full text-left border-collapse">
             <thead>
               <tr className="bg-[#1E3A5F] text-white text-xs font-medium">
-                <th className="py-2.5 px-4 whitespace-nowrap">Sinf</th>
-                <th className="py-2.5 px-4 whitespace-nowrap">O‘quvchi</th>
+                <th className="py-2.5 px-4 whitespace-nowrap">Sinf / Lavozim</th>
+                <th className="py-2.5 px-4 whitespace-nowrap">O‘quvchi / O‘qituvchi</th>
                 <th className="py-2.5 px-4 whitespace-nowrap">Kitob</th>
                 <th className="py-2.5 px-4 whitespace-nowrap">Berilgan</th>
                 <th className="py-2.5 px-4 whitespace-nowrap">Qaytarish</th>
@@ -238,51 +250,68 @@ export function DeadlinesView() {
                   </td>
                 </tr>
               ) : (
-                filteredRows.map(({ loan, student, book, dl }) => (
-                  <tr key={loan.id} className="hover:bg-[#F8FAFC]">
-                    <td className="py-2.5 px-4 font-medium text-[#1E3A5F] whitespace-nowrap">
-                      {student?.className ?? '—'}
-                    </td>
-                    <td className="py-2.5 px-4 text-[#0F172A]">{student?.fullName ?? '—'}</td>
-                    <td className="py-2.5 px-4 text-[#334155] max-w-[280px] truncate">
-                      {book?.title ?? '—'}
-                    </td>
-                    <td className="py-2.5 px-4 text-xs text-[#64748B] tabular-nums whitespace-nowrap">
-                      {formatYmdDisplay(loan.issuedDate)}
-                    </td>
-                    <td className="py-2.5 px-4 text-xs font-medium text-[#0F172A] tabular-nums whitespace-nowrap">
-                      {formatYmdDisplay(loan.dueDate)}
-                    </td>
-                    <td className="py-2.5 px-4 whitespace-nowrap">
-                      {loan.status === 'returned' ? (
-                        <StatusText tone="green">
-                          Qaytarilgan ({formatYmdDisplay(loan.returnedDate)})
-                        </StatusText>
-                      ) : dl.bucket === 'overdue' ? (
-                        <StatusText tone="red">{Math.abs(dl.deltaDays)} kun kechikkan</StatusText>
-                      ) : dl.bucket === 'due_today' ? (
-                        <StatusText tone="amber">Bugun</StatusText>
-                      ) : (
-                        <StatusText tone="blue">Faol</StatusText>
-                      )}
-                    </td>
-                    <td className="py-2.5 px-4 text-right whitespace-nowrap">
-                      {loan.status === 'active' ? (
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={busyLoanId === loan.id}
-                          onClick={() => void handleQuickReturn(loan.id)}
-                        >
-                          <Check className="w-3.5 h-3.5 text-[#059669]" />
-                          Qaytarildi
-                        </Button>
-                      ) : (
-                        <span className="text-xs text-[#94A3B8]">—</span>
-                      )}
-                    </td>
-                  </tr>
-                ))
+                filteredRows.map(({ loan, borrower, book, dl }) => {
+                  const isOverdue = loan.status === 'active' && dl.bucket === 'overdue';
+                  return (
+                    <tr
+                      key={loan.id}
+                      className={
+                        isOverdue ? 'bg-[#FEF2F2]/70 hover:bg-[#FEF2F2]' : 'hover:bg-[#F8FAFC]'
+                      }
+                    >
+                      <td className="py-2.5 px-4 whitespace-nowrap">
+                        <span className="font-medium text-[#1E3A5F]">{borrower.badgeText}</span>
+                        {borrower.type === 'teacher' && (
+                          <div className="text-[11px] text-[#64748B] truncate max-w-[160px]">
+                            {borrower.groupLabel}
+                          </div>
+                        )}
+                      </td>
+                      <td className="py-2.5 px-4 text-[#0F172A]">{borrower.fullName}</td>
+                      <td className="py-2.5 px-4 text-[#334155] max-w-[260px] truncate">
+                        {book?.title ?? '—'}
+                      </td>
+                      <td className="py-2.5 px-4 text-xs text-[#64748B] tabular-nums whitespace-nowrap">
+                        {formatYmdDisplay(loan.issuedDate)}
+                      </td>
+                      <td
+                        className={`py-2.5 px-4 text-xs font-medium tabular-nums whitespace-nowrap ${
+                          isOverdue ? 'text-[#DC2626]' : 'text-[#0F172A]'
+                        }`}
+                      >
+                        {formatYmdDisplay(loan.dueDate)}
+                      </td>
+                      <td className="py-2.5 px-4 whitespace-nowrap">
+                        {loan.status === 'returned' ? (
+                          <StatusText tone="green">
+                            Qaytarilgan ({formatYmdDisplay(loan.returnedDate)})
+                          </StatusText>
+                        ) : isOverdue ? (
+                          <StatusText tone="red">{Math.abs(dl.deltaDays)} kun kechikkan</StatusText>
+                        ) : dl.bucket === 'due_today' ? (
+                          <StatusText tone="amber">Bugun</StatusText>
+                        ) : (
+                          <StatusText tone="blue">Faol</StatusText>
+                        )}
+                      </td>
+                      <td className="py-2.5 px-4 text-right whitespace-nowrap">
+                        {loan.status === 'active' ? (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={busyLoanId === loan.id}
+                            onClick={() => void handleQuickReturn(loan.id)}
+                          >
+                            <Check className="w-3.5 h-3.5 text-[#059669]" />
+                            Qaytarildi
+                          </Button>
+                        ) : (
+                          <span className="text-xs text-[#94A3B8]">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>

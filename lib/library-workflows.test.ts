@@ -29,6 +29,19 @@ test('generateFullLibraryWorkbook outputs a valid 10-worksheet ExcelJS workbook 
         updatedAt: now,
       },
     ],
+    teachers: [
+      {
+        id: 'tch_1',
+        internalTeacherId: 'TCH-0001',
+        fullName: 'Karimova Dilnoza',
+        position: 'Matematika o‘qituvchisi',
+        registeredAt: '2026-11-19',
+        status: 'active',
+        notes: '',
+        createdAt: now,
+        updatedAt: now,
+      },
+    ],
     bookTitles: [
       {
         id: 'book_1',
@@ -109,7 +122,9 @@ test('generateFullLibraryWorkbook outputs a valid 10-worksheet ExcelJS workbook 
     loans: [
       {
         id: 'loan_1',
+        borrowerType: 'student',
         studentId: 'stu_1',
+        teacherId: null,
         bookTitleId: 'book_1',
         physicalCopyId: 'copy_1',
         issuedDate: '2026-11-01',
@@ -152,6 +167,7 @@ test('generateFullLibraryWorkbook outputs a valid 10-worksheet ExcelJS workbook 
     'Asl inventar yozuvlari',
     'Fizik nusxalar',
     "O'quvchilar",
+    "O'qituvchilar",
     'Berilgan kitoblar',
     'Qaytarilgan kitoblar',
     "Muddati o'tganlar",
@@ -163,6 +179,10 @@ test('generateFullLibraryWorkbook outputs a valid 10-worksheet ExcelJS workbook 
   const catalogSheet = wb.getWorksheet('Kitoblar katalogi')!;
   const titleCell = catalogSheet.getRow(2).getCell(3).value;
   assert.equal(titleCell, "'=MaliciousTitle");
+
+  // Verify teachers sheet populated
+  const teacherSheet = wb.getWorksheet("O'qituvchilar")!;
+  assert.equal(teacherSheet.getRow(2).getCell(2).value, 'Karimova Dilnoza');
 
   // Verify original inventory columns preserved
   const rawSheet = wb.getWorksheet('Asl inventar yozuvlari')!;

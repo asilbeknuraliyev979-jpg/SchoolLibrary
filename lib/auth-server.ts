@@ -25,6 +25,67 @@ interface StoredAuthState {
   };
 }
 
+interface LoginRateLimitRecord {
+  attempts: number;
+  firstAttemptAt: number;
+  lockedUntil: number | null;
+}
+
+const MAX_LOGIN_ATTEMPTS = 5;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+const LOGIN_LOCKOUT_MS = 15 * 60 * 1000; // 15 minutes
+const loginAttemptsStore = new Map<string, LoginRateLimitRecord>();
+
+export function checkLoginRateLimit(key: string): { allowed: boolean; retryAfterMinutes: number } {
+  const now = Date.now();
+  const rec = loginAttemptsStore.get(key);
+  if (!rec) return { allowed: true, retryAfterMinutes: 0 };
+
+  if (rec.lockedUntil && now < rec.lockedUntil) {
+    const mins = Math.max(1, Math.ceil((rec.lockedUntil - now) / 60000));
+    return { allowed: false, retryAfterMinutes: mins };
+  }
+
+  if (rec.lockedUntil && now >= rec.lockedUntil) {
+    loginAttemptsStore.delete(key);
+    return { allowed: true, retryAfterMinutes: 0 };
+  }
+
+  if (now - rec.firstAttemptAt > LOGIN_WINDOW_MS) {
+    loginAttemptsStore.delete(key);
+    return { allowed: true, retryAfterMinutes: 0 };
+  }
+
+  return { allowed: true, retryAfterMinutes: 0 };
+}
+
+export function recordFailedLoginAttempt(key: string): { locked: boolean; remainingAttempts: number; retryAfterMinutes: number } {
+  const now = Date.now();
+  const existing = loginAttemptsStore.get(key);
+  if (!existing || now - existing.firstAttemptAt > LOGIN_WINDOW_MS) {
+    loginAttemptsStore.set(key, { attempts: 1, firstAttemptAt: now, lockedUntil: null });
+    return { locked: false, remainingAttempts: MAX_LOGIN_ATTEMPTS - 1, retryAfterMinutes: 0 };
+  }
+
+  existing.attempts += 1;
+  if (existing.attempts >= MAX_LOGIN_ATTEMPTS) {
+    existing.lockedUntil = now + LOGIN_LOCKOUT_MS;
+    loginAttemptsStore.set(key, existing);
+    return { locked: true, remainingAttempts: 0, retryAfterMinutes: Math.ceil(LOGIN_LOCKOUT_MS / 60000) };
+  }
+
+  loginAttemptsStore.set(key, existing);
+  return {
+    locked: false,
+    remainingAttempts: Math.max(0, MAX_LOGIN_ATTEMPTS - existing.attempts),
+    retryAfterMinutes: 0,
+  };
+}
+
+export function clearLoginRateLimit(key: string): void {
+  loginAttemptsStore.delete(key);
+}
+
 interface SessionPayload {
   sub: string;
   username: string;

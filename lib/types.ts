@@ -43,6 +43,8 @@ export interface LibrarianProfile {
   updatedAt: string;
 }
 
+export type BorrowerType = 'student' | 'teacher';
+
 export interface Student {
   id: string;
   internalStudentId: string;
@@ -54,6 +56,55 @@ export interface Student {
   notes: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface Teacher {
+  id: string;
+  internalTeacherId: string;
+  fullName: string;
+  position: string;
+  registeredAt: string;
+  status: 'active' | 'archived';
+  notes: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface StudentImportBackup {
+  id: string;
+  fileName: string;
+  createdAt: string;
+  actorName: string;
+  previousStudents: Student[];
+  summary: {
+    totalInFile: number;
+    added: number;
+    kept: number;
+    reactivated: number;
+    archived: number;
+  };
+}
+
+export interface ParsedStudentRow {
+  className: string;
+  fullName: string;
+}
+
+export interface StudentReplacePreview {
+  fileName: string;
+  totalRowsInFile: number;
+  uniqueRowsInFile: number;
+  duplicatesInFile: number;
+  skippedInvalidRows: number;
+  toAddCount: number;
+  toKeepCount: number;
+  toReactivateCount: number;
+  toArchiveCount: number;
+  archivedWithActiveLoansCount: number;
+  sampleAdd: ParsedStudentRow[];
+  sampleReactivate: ParsedStudentRow[];
+  sampleArchive: Array<{ className: string; fullName: string; activeLoans: number }>;
+  rows: ParsedStudentRow[];
 }
 
 export interface RawInventoryColumns {
@@ -154,7 +205,9 @@ export interface SourceInventoryRecord {
 
 export interface Loan {
   id: string;
-  studentId: string;
+  borrowerType?: BorrowerType;
+  studentId: string | null;
+  teacherId?: string | null;
   bookTitleId: string;
   physicalCopyId: string;
   issuedDate: string; // YYYY-MM-DD in Asia/Tashkent
@@ -183,6 +236,7 @@ export interface InventoryIncident {
   bookTitleId: string;
   loanId: string | null;
   studentId: string | null;
+  teacherId?: string | null;
   incidentType: 'damaged' | 'lost';
   notes: string;
   resolved: boolean;
@@ -222,6 +276,8 @@ export interface LibrarySettings {
 export interface LibraryDatabase {
   settings: LibrarySettings;
   students: Student[];
+  teachers: Teacher[];
+  studentImportBackups?: StudentImportBackup[];
   bookTitles: BookTitle[];
   physicalCopies: PhysicalCopy[];
   importBatches: ImportBatch[];

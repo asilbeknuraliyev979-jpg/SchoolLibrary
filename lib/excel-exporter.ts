@@ -77,7 +77,7 @@ const CONDITION_LABELS: Record<string, string> = {
 };
 
 /**
- * Generates the complete 10-worksheet School Library ExcelJS workbook.
+ * Generates the complete 11-worksheet School Library ExcelJS workbook (including Teachers).
  */
 export async function generateFullLibraryWorkbook(db: LibraryDatabase): Promise<Buffer> {
   const wb = new ExcelJS.Workbook();
@@ -88,7 +88,25 @@ export async function generateFullLibraryWorkbook(db: LibraryDatabase): Promise<
 
   const bookMap = new Map(db.bookTitles.map((b) => [b.id, b]));
   const studentMap = new Map(db.students.map((s) => [s.id, s]));
+  const teacherMap = new Map((db.teachers ?? []).map((t) => [t.id, t]));
   const copyMap = new Map(db.physicalCopies.map((c) => [c.id, c]));
+
+  const resolveBorrower = (loan: LibraryDatabase['loans'][number]) => {
+    if (loan.borrowerType === 'teacher') {
+      const t = loan.teacherId ? teacherMap.get(loan.teacherId) : undefined;
+      return {
+        role: "O'qituvchi",
+        name: t?.fullName ?? '—',
+        group: t?.position ?? "O'qituvchi",
+      };
+    }
+    const s = loan.studentId ? studentMap.get(loan.studentId) : undefined;
+    return {
+      role: "O'quvchi",
+      name: s?.fullName ?? '—',
+      group: s?.className ?? '—',
+    };
+  };
 
   const confirmedCopies = db.physicalCopies.filter((c) => c.confirmed && c.status !== 'archived');
   const availableCopies = confirmedCopies.filter((c) => c.status === 'available');
@@ -97,7 +115,11 @@ export async function generateFullLibraryWorkbook(db: LibraryDatabase): Promise<
   const returnedLoans = db.loans.filter((l) => l.status === 'returned');
   const dueTodayLoans = activeLoans.filter((l) => classifyLoanDeadline(l, today).bucket === 'due_today');
   const overdueLoans = activeLoans.filter((l) => classifyLoanDeadline(l, today).bucket === 'overdue');
-  const activeBorrowers = new Set(activeLoans.map((l) => l.studentId));
+  const activeBorrowers = new Set(
+    activeLoans.map((l) =>
+      l.borrowerType === 'teacher' ? `tch:${l.teacherId ?? ''}` : `stu:${l.studentId ?? ''}`
+    )
+  );
   const booksNeedingReview = db.bookTitles.filter((b) => b.reviewStatus === 'needs_review');
 
   // 1. Umumiy statistika
@@ -110,11 +132,12 @@ export async function generateFullLibraryWorkbook(db: LibraryDatabase): Promise<
     ['Jami katalog yozuvlari (nomlar)', db.bookTitles.filter((b) => b.reviewStatus !== 'archived').length, 'Inventar.xlsx va qo‘lda kiritilgan'],
     ['Tasdiqlangan fizik nusxalar', confirmedCopies.length, 'Faqat kutubxonachi tasdiqlagan nusxalar'],
     ['Hozir mavjud nusxalar', availableCopies.length, 'Berish uchun tayyor'],
-    ['Berilgan kitoblar', issuedCopies.length, 'O‘quvchilar qo‘lida'],
+    ['Berilgan kitoblar', issuedCopies.length, 'O‘quvchi va o‘qituvchilar qo‘lida'],
     ['Bugun qaytarilishi kerak', dueTodayLoans.length, formatYmdDisplay(today)],
     ["Muddati o'tgan kitoblar", overdueLoans.length, 'Zudlik bilan nazorat talab qiladi'],
-    ["Faol kitob olgan o'quvchilar", activeBorrowers.size, 'Kamida 1 ta faol kitobi bor'],
+    ['Faol kitob olgan foydalanuvchilar', activeBorrowers.size, 'Kamida 1 ta faol kitobi bor'],
     ["Jami faol o'quvchilar", db.students.filter((s) => s.status === 'active').length, 'O‘quvchilar bazasi'],
+    ["Jami faol o'qituvchilar", (db.teachers ?? []).filter((t) => t.status === 'active').length, 'O‘qituvchilar bazasi'],
     ['Tekshiruv talab qiladigan inventar yozuvlari', booksNeedingReview.length, 'Diapazon, takroriy raqam yoki yil xatoligi'],
     ['Jami qaytarilgan kitoblar', returnedLoans.length, 'Yakunlangan operatsiyalar'],
     ['Shikastlangan / yo‘qolgan hodisalar', db.inventoryIncidents.length, 'Inventar hodisalari'],
@@ -218,37 +241,56 @@ export async function generateFullLibraryWorkbook(db: LibraryDatabase): Promise<
   // 5. O'quvchilar
   const ws5 = wb.addWorksheet("O'quvchilar");
   ws5.addRow([
-    'Ichki ID',
-    "Maktab o'quvchi raqami",
-    'F.I.Sh.',
     'Sinf',
-    "Ro'yxatga olingan sana",
+    'Familiya va ism',
     'Holat',
     'Faol kitoblar',
     'Jami olgan kitoblar',
   ]);
   for (const s of db.students) {
-    const sLoans = db.loans.filter((l) => l.studentId === s.id);
+    const sLoans = db.loans.filter((l) => (l.borrowerType ?? 'student') === 'student' && l.studentId === s.id);
     const sActive = sLoans.filter((l) => l.status === 'active').length;
     addSafeRow(ws5, [
-      s.internalStudentId,
-      s.schoolStudentNumber || '—',
-      s.fullName,
       s.className,
-      formatYmdDisplay(s.registeredAt),
+      s.fullName,
       s.status === 'active' ? 'Faol' : 'Arxivlangan',
       sActive,
       sLoans.length,
     ]);
   }
-  styleHeaderRow(ws5, [16, 20, 32, 10, 18, 14, 14, 18]);
+  styleHeaderRow(ws5, [12, 36, 16, 14, 18]);
 
-  // 6. Berilgan kitoblar
+  // 6. O'qituvchilar
+  const wsTeachers = wb.addWorksheet("O'qituvchilar");
+  wsTeachers.addRow([
+    'Ichki ID',
+    'F.I.Sh.',
+    'Lavozimi',
+    'Holat',
+    'Faol kitoblar',
+    'Jami olgan kitoblar',
+  ]);
+  for (const t of db.teachers ?? []) {
+    const tLoans = db.loans.filter((l) => l.borrowerType === 'teacher' && l.teacherId === t.id);
+    const tActive = tLoans.filter((l) => l.status === 'active').length;
+    addSafeRow(wsTeachers, [
+      t.internalTeacherId,
+      t.fullName,
+      t.position,
+      t.status === 'active' ? 'Faol' : 'Arxivlangan',
+      tActive,
+      tLoans.length,
+    ]);
+  }
+  styleHeaderRow(wsTeachers, [14, 34, 28, 14, 14, 18]);
+
+  // 7. Berilgan kitoblar
   const ws6 = wb.addWorksheet('Berilgan kitoblar');
   ws6.addRow([
     'ID',
-    "O'quvchi",
-    'Sinf',
+    'Turi',
+    'Sinf / Lavozim',
+    'F.I.Sh.',
     'Kitob nomi',
     'Nusxa kodi',
     'Inventar raqami',
@@ -258,7 +300,7 @@ export async function generateFullLibraryWorkbook(db: LibraryDatabase): Promise<
     'Holat',
   ]);
   for (const l of activeLoans) {
-    const s = studentMap.get(l.studentId);
+    const borrower = resolveBorrower(l);
     const b = bookMap.get(l.bookTitleId);
     const c = copyMap.get(l.physicalCopyId);
     const { bucket, deltaDays } = classifyLoanDeadline(l, today);
@@ -272,8 +314,9 @@ export async function generateFullLibraryWorkbook(db: LibraryDatabase): Promise<
             : 'Jarayonda';
     addSafeRow(ws6, [
       l.id,
-      s?.fullName ?? '—',
-      s?.className ?? '—',
+      borrower.role,
+      borrower.group,
+      borrower.name,
       b?.title ?? '—',
       c?.internalCopyCode ?? '—',
       c?.originalInventoryNumber ?? '—',
@@ -283,14 +326,15 @@ export async function generateFullLibraryWorkbook(db: LibraryDatabase): Promise<
       statusText,
     ]);
   }
-  styleHeaderRow(ws6, [16, 28, 10, 34, 18, 16, 14, 16, 20, 18]);
+  styleHeaderRow(ws6, [16, 14, 22, 30, 34, 16, 16, 14, 16, 20, 18]);
 
-  // 7. Qaytarilgan kitoblar
+  // 8. Qaytarilgan kitoblar
   const ws7 = wb.addWorksheet('Qaytarilgan kitoblar');
   ws7.addRow([
     'ID',
-    "O'quvchi",
-    'Sinf',
+    'Turi',
+    'Sinf / Lavozim',
+    'F.I.Sh.',
     'Kitob nomi',
     'Nusxa kodi',
     'Berilgan sana',
@@ -300,13 +344,14 @@ export async function generateFullLibraryWorkbook(db: LibraryDatabase): Promise<
     'Izoh',
   ]);
   for (const l of returnedLoans) {
-    const s = studentMap.get(l.studentId);
+    const borrower = resolveBorrower(l);
     const b = bookMap.get(l.bookTitleId);
     const c = copyMap.get(l.physicalCopyId);
     addSafeRow(ws7, [
       l.id,
-      s?.fullName ?? '—',
-      s?.className ?? '—',
+      borrower.role,
+      borrower.group,
+      borrower.name,
       b?.title ?? '—',
       c?.internalCopyCode ?? '—',
       formatYmdDisplay(l.issuedDate),
@@ -316,13 +361,14 @@ export async function generateFullLibraryWorkbook(db: LibraryDatabase): Promise<
       l.notes || '',
     ]);
   }
-  styleHeaderRow(ws7, [16, 28, 10, 34, 18, 14, 20, 20, 18, 28]);
+  styleHeaderRow(ws7, [16, 14, 22, 30, 34, 16, 14, 20, 20, 18, 28]);
 
-  // 8. Muddati o'tganlar
+  // 9. Muddati o'tganlar
   const ws8 = wb.addWorksheet("Muddati o'tganlar");
   ws8.addRow([
-    "O'quvchi",
-    'Sinf',
+    'Turi',
+    'Sinf / Lavozim',
+    'F.I.Sh.',
     'Kitob nomi',
     'Nusxa kodi',
     'Inventar raqami',
@@ -331,13 +377,14 @@ export async function generateFullLibraryWorkbook(db: LibraryDatabase): Promise<
     'Kechikkan kunlar',
   ]);
   for (const l of overdueLoans) {
-    const s = studentMap.get(l.studentId);
+    const borrower = resolveBorrower(l);
     const b = bookMap.get(l.bookTitleId);
     const c = copyMap.get(l.physicalCopyId);
     const { deltaDays } = classifyLoanDeadline(l, today);
     addSafeRow(ws8, [
-      s?.fullName ?? '—',
-      s?.className ?? '—',
+      borrower.role,
+      borrower.group,
+      borrower.name,
       b?.title ?? '—',
       c?.internalCopyCode ?? '—',
       c?.originalInventoryNumber ?? '—',
@@ -346,7 +393,7 @@ export async function generateFullLibraryWorkbook(db: LibraryDatabase): Promise<
       Math.abs(deltaDays),
     ]);
   }
-  styleHeaderRow(ws8, [28, 10, 34, 18, 16, 14, 16, 16]);
+  styleHeaderRow(ws8, [14, 22, 30, 34, 16, 16, 14, 16, 16]);
 
   // 9. Operatsiyalar tarixi
   const ws9 = wb.addWorksheet('Operatsiyalar tarixi');

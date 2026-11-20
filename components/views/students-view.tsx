@@ -2,11 +2,13 @@
 
 import React, { useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   ChevronLeft,
   ChevronRight,
   Download,
   FileSpreadsheet,
   Plus,
+  RotateCcw,
   Search,
   Upload,
 } from 'lucide-react';
@@ -21,7 +23,8 @@ import {
   SelectField,
 } from '@/components/ui/primitives';
 import { authFetch } from '@/lib/api-client';
-import { getTodayTashkent } from '@/lib/date-utils';
+import { formatDateTimeTashkent, getTodayTashkent } from '@/lib/date-utils';
+import type { StudentReplacePreview } from '@/lib/types';
 import { compareClassNames } from '@/lib/utils';
 
 const PAGE_SIZE = 50;
@@ -32,6 +35,7 @@ export function StudentsView() {
 
   const [search, setSearch] = useState('');
   const [classFilter, setClassFilter] = useState('');
+  const [statusView, setStatusView] = useState<'active' | 'archived'>('active');
   const [page, setPage] = useState(1);
   const [busy, setBusy] = useState(false);
 
@@ -40,22 +44,35 @@ export function StudentsView() {
   const [newClass, setNewClass] = useState('');
   const [newFullName, setNewFullName] = useState('');
 
+  // Replace-Import Preview Modal
+  const [preview, setPreview] = useState<StudentReplacePreview | null>(null);
+
+  // Rollback Confirmation Modal
+  const [rollbackOpen, setRollbackOpen] = useState(false);
+
+  const allStudents = useMemo(() => data?.students ?? [], [data?.students]);
   const activeStudents = useMemo(
-    () => (data?.students ?? []).filter((s) => s.status === 'active'),
-    [data?.students]
+    () => allStudents.filter((s) => s.status === 'active'),
+    [allStudents]
   );
+  const archivedStudents = useMemo(
+    () => allStudents.filter((s) => s.status === 'archived'),
+    [allStudents]
+  );
+
+  const currentList = statusView === 'active' ? activeStudents : archivedStudents;
 
   const classes = useMemo(() => {
     const set = new Set<string>();
-    for (const s of activeStudents) {
+    for (const s of currentList) {
       if (s.className) set.add(s.className);
     }
     return Array.from(set).sort(compareClassNames);
-  }, [activeStudents]);
+  }, [currentList]);
 
   const filteredStudents = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return activeStudents
+    return currentList
       .filter((s) => {
         if (classFilter && s.className !== classFilter) return false;
         if (!q) return true;
@@ -68,7 +85,7 @@ export function StudentsView() {
         if (c !== 0) return c;
         return a.fullName.localeCompare(b.fullName, 'uz');
       });
-  }, [activeStudents, classFilter, search]);
+  }, [currentList, classFilter, search]);
 
   const totalPages = Math.max(1, Math.ceil(filteredStudents.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
@@ -78,23 +95,71 @@ export function StudentsView() {
     return <p className="text-xs text-[#64748B]">Ma’lumotlar yuklanmoqda...</p>;
   }
 
-  async function handleImportAttached() {
+  const latestBackup = data.studentImportBackups?.[0] ?? null;
+
+  async function handlePreviewAttached() {
     setBusy(true);
     try {
       const res = await authFetch('/api/students', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'import_attached' }),
+        body: JSON.stringify({ action: 'preview_attached' }),
       });
       const json = await res.json();
-      if (!res.ok) throw new Error(json.error || 'Importda xatolik yuz berdi.');
-      if (json.imported === 0 && json.skipped > 0) {
-        toast.info(`Barcha ${json.skipped} nafar o‘quvchi avval import qilingan (takroriy import oldi olindi).`);
-      } else {
-        toast.success(
-          `${json.imported} nafar o‘quvchi import qilindi${json.skipped ? ` (${json.skipped} ta takroriy o‘tkazib yuborildi)` : ''}.`
-        );
-      }
+      if (!res.ok) throw new Error(json.error || 'Faylni tahlil qilishda xatolik.');
+      setPreview(json.preview as StudentReplacePreview);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Xatolik yuz berdi.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleUploadXlsxForPreview(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setBusy(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('mode', 'preview');
+      const res = await authFetch('/api/students', {
+        method: 'POST',
+        body: formData,
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || 'XLSX faylni tahlil qilishda xatolik.');
+      setPreview(json.preview as StudentReplacePreview);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Xatolik yuz berdi.');
+    } finally {
+      setBusy(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  }
+
+  async function handleConfirmReplace() {
+    if (!preview) return;
+    setBusy(true);
+    try {
+      const res = await authFetch('/api/students', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'commit_replace_rows',
+          fileName: preview.fileName,
+          rows: preview.rows,
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || 'Yangilashda xatolik yuz berdi.');
+      toast.success(
+        `O‘quvchilar bazasi yangilandi: ${json.activeTotal} faol (+${json.added} yangi, ${json.archived} arxivlandi).`
+      );
+      setPreview(null);
+      setStatusView('active');
+      setClassFilter('');
+      setPage(1);
       await refreshData();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Xatolik yuz berdi.');
@@ -103,32 +168,26 @@ export function StudentsView() {
     }
   }
 
-  async function handleUploadXlsx(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  async function handleConfirmRollback() {
     setBusy(true);
     try {
-      const formData = new FormData();
-      formData.append('file', file);
       const res = await authFetch('/api/students', {
         method: 'POST',
-        body: formData,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'rollback_last' }),
       });
       const json = await res.json();
-      if (!res.ok) throw new Error(json.error || 'XLSX faylni yuklashda xatolik.');
-      if (json.imported === 0 && json.skipped > 0) {
-        toast.info(`Barcha ${json.skipped} ta yozuv avval mavjud (takroriy import oldi olindi).`);
-      } else {
-        toast.success(
-          `${json.imported} nafar o‘quvchi import qilindi${json.skipped ? ` (${json.skipped} ta takroriy o‘tkazib yuborildi)` : ''}.`
-        );
-      }
+      if (!res.ok) throw new Error(json.error || 'Qayta tiklashda xatolik.');
+      toast.success(
+        `Avvalgi ro‘yxat tiklandi (${json.restoredActiveCount} nafar faol o‘quvchi).`
+      );
+      setRollbackOpen(false);
+      setStatusView('active');
       await refreshData();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Xatolik yuz berdi.');
     } finally {
       setBusy(false);
-      if (fileInputRef.current) fileInputRef.current.value = '';
     }
   }
 
@@ -166,8 +225,8 @@ export function StudentsView() {
   function handleExportXlsx() {
     const today = getTodayTashkent();
     void downloadTableXlsx({
-      fileName: `Oquvchilar_${classFilter || 'Barchasi'}_${today}.xlsx`,
-      sheetName: 'Oquvchilar',
+      fileName: `Oquvchilar_${statusView}_${classFilter || 'Barchasi'}_${today}.xlsx`,
+      sheetName: statusView === 'active' ? 'Oquvchilar' : 'Arxivlangan oquvchilar',
       headers: ['Sinf', 'Familiya va ism'],
       rows: filteredStudents.map((s) => [s.className, s.fullName]),
       columnWidths: [14, 42],
@@ -208,6 +267,41 @@ export function StudentsView() {
               </option>
             ))}
           </SelectField>
+
+          {archivedStudents.length > 0 && (
+            <div className="inline-flex rounded-lg border border-[#CBD5E1] p-0.5 bg-white">
+              <button
+                type="button"
+                onClick={() => {
+                  setStatusView('active');
+                  setClassFilter('');
+                  setPage(1);
+                }}
+                className={`px-3 py-1 rounded-md text-xs font-medium cursor-pointer transition-colors ${
+                  statusView === 'active'
+                    ? 'bg-[#1E3A5F] text-white'
+                    : 'text-[#475569] hover:text-[#0F172A]'
+                }`}
+              >
+                Faol ({activeStudents.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setStatusView('archived');
+                  setClassFilter('');
+                  setPage(1);
+                }}
+                className={`px-3 py-1 rounded-md text-xs font-medium cursor-pointer transition-colors ${
+                  statusView === 'archived'
+                    ? 'bg-[#1E3A5F] text-white'
+                    : 'text-[#475569] hover:text-[#0F172A]'
+                }`}
+              >
+                Arxiv ({archivedStudents.length})
+              </button>
+            </div>
+          )}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -215,10 +309,10 @@ export function StudentsView() {
             ref={fileInputRef}
             type="file"
             accept=".xlsx,.xls"
-            onChange={(e) => void handleUploadXlsx(e)}
+            onChange={(e) => void handleUploadXlsxForPreview(e)}
             className="hidden"
           />
-          <Button size="sm" onClick={() => void handleImportAttached()} disabled={busy}>
+          <Button size="sm" onClick={() => void handlePreviewAttached()} disabled={busy}>
             <FileSpreadsheet className="w-3.5 h-3.5" />
             426 o‘quvchini import qilish
           </Button>
@@ -231,6 +325,18 @@ export function StudentsView() {
             <Upload className="w-3.5 h-3.5" />
             XLSX yuklash
           </Button>
+          {latestBackup && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setRollbackOpen(true)}
+              disabled={busy}
+              title={`Oxirgi importni bekor qilish (${latestBackup.fileName})`}
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              Qayta tiklash
+            </Button>
+          )}
           <Button size="sm" variant="outline" onClick={() => setAddOpen(true)}>
             <Plus className="w-3.5 h-3.5" />
             Qo‘shish
@@ -256,7 +362,9 @@ export function StudentsView() {
               {pageItems.length === 0 ? (
                 <tr>
                   <td colSpan={2} className="py-10 px-4 text-center text-xs text-[#64748B]">
-                    O‘quvchilar ro‘yxati bo‘sh. &ldquo;426 o‘quvchini import qilish&rdquo; tugmasini bosing.
+                    {statusView === 'active'
+                      ? 'O‘quvchilar ro‘yxati bo‘sh. "426 o‘quvchini import qilish" yoki "XLSX yuklash" tugmasini bosing.'
+                      : 'Arxivlangan o‘quvchilar mavjud emas.'}
                   </td>
                 </tr>
               ) : (
@@ -276,7 +384,8 @@ export function StudentsView() {
         {/* Pagination Footer */}
         <div className="px-4 py-3 border-t border-[#E2E8F0] flex items-center justify-between gap-3 text-xs text-[#64748B]">
           <span className="tabular-nums">
-            Jami: <strong className="text-[#0F172A]">{filteredStudents.length.toLocaleString('uz-UZ')}</strong> nafar o‘quvchi
+            Jami: <strong className="text-[#0F172A]">{filteredStudents.length.toLocaleString('uz-UZ')}</strong> nafar{' '}
+            {statusView === 'active' ? 'faol' : 'arxivlangan'} o‘quvchi
             {classes.length > 0 && ` · ${classes.length} ta sinf`}
           </span>
           <div className="flex items-center gap-2">
@@ -302,6 +411,164 @@ export function StudentsView() {
           </div>
         </div>
       </PanelCard>
+
+      {/* Pre-Import Preview & Confirmation Modal */}
+      <ModalDialog
+        open={Boolean(preview)}
+        onOpenChange={(open) => {
+          if (!open && !busy) setPreview(null);
+        }}
+        title="O‘quvchilar bazasini yangilash — Tasdiqlash"
+        description={
+          preview
+            ? `Fayl: ${preview.fileName}. Yangi ro‘yxat faol o‘quvchilarni almashtiradi, yo‘q o‘quvchilar arxivlanadi (kitob tarixi saqlanadi).`
+            : ''
+        }
+        maxWidth="max-w-2xl"
+      >
+        {preview && (
+          <div className="space-y-4">
+            {/* Summary Grid */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+              <div className="p-3 rounded-lg border border-[#E2E8F0] bg-[#F8FAFC]">
+                <div className="text-[11px] text-[#64748B]">Yangi qo‘shiladi</div>
+                <div className="text-lg font-semibold text-[#059669] tabular-nums mt-0.5">
+                  +{preview.toAddCount}
+                </div>
+              </div>
+              <div className="p-3 rounded-lg border border-[#E2E8F0] bg-[#F8FAFC]">
+                <div className="text-[11px] text-[#64748B]">Saqlanib qoladi</div>
+                <div className="text-lg font-semibold text-[#1E3A5F] tabular-nums mt-0.5">
+                  {preview.toKeepCount}
+                </div>
+              </div>
+              <div className="p-3 rounded-lg border border-[#E2E8F0] bg-[#F8FAFC]">
+                <div className="text-[11px] text-[#64748B]">Qayta faollashadi</div>
+                <div className="text-lg font-semibold text-[#0284C7] tabular-nums mt-0.5">
+                  {preview.toReactivateCount}
+                </div>
+              </div>
+              <div className="p-3 rounded-lg border border-[#E2E8F0] bg-[#F8FAFC]">
+                <div className="text-[11px] text-[#64748B]">Arxivlanadi</div>
+                <div className="text-lg font-semibold text-[#D97706] tabular-nums mt-0.5">
+                  {preview.toArchiveCount}
+                </div>
+              </div>
+            </div>
+
+            {(preview.duplicatesInFile > 0 || preview.skippedInvalidRows > 0) && (
+              <div className="text-xs text-[#475569] bg-[#F8FAFC] border border-[#E2E8F0] rounded-lg px-3.5 py-2.5">
+                Fayldan <strong>{preview.uniqueRowsInFile}</strong> nafar noyob o‘quvchi aniqlandi
+                {preview.duplicatesInFile > 0 && ` · ${preview.duplicatesInFile} ta takroriy qator chiqarildi`}
+                {preview.skippedInvalidRows > 0 && ` · ${preview.skippedInvalidRows} ta noto‘g‘ri qator o‘tkazildi`}.
+              </div>
+            )}
+
+            {preview.archivedWithActiveLoansCount > 0 && (
+              <div className="flex items-start gap-2.5 p-3 rounded-lg border border-[#FDE68A] bg-[#FFFBEB] text-xs text-[#92400E]">
+                <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-[#D97706]" />
+                <div>
+                  Arxivlanadigan o‘quvchilar orasida <strong>{preview.archivedWithActiveLoansCount}</strong> nafarining
+                  qo‘lida qaytarilmagan kitob mavjud. Ularning faol kitoblari va olish tarixi o‘chirilmaydi — monitoringda
+                  ko‘rinib turadi.
+                </div>
+              </div>
+            )}
+
+            {/* Preview Sample: Incoming Students */}
+            {preview.sampleAdd.length > 0 && (
+              <div>
+                <div className="text-xs font-semibold text-[#0F172A] mb-1.5">
+                  Yangi qo‘shiladigan o‘quvchilar namunasi (faqat Sinf va Familiya-ism)
+                </div>
+                <div className="border border-[#E2E8F0] rounded-lg overflow-hidden max-h-44 overflow-y-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="bg-[#1E3A5F] text-white">
+                        <th className="py-1.5 px-3 w-24">Sinf</th>
+                        <th className="py-1.5 px-3">Familiya va ism</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#E2E8F0]">
+                      {preview.sampleAdd.map((r, i) => (
+                        <tr key={`${r.className}-${r.fullName}-${i}`}>
+                          <td className="py-1.5 px-3 font-medium text-[#1E3A5F]">{r.className}</td>
+                          <td className="py-1.5 px-3 text-[#0F172A]">{r.fullName}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* Preview Sample: Students to Archive */}
+            {preview.sampleArchive.length > 0 && (
+              <div>
+                <div className="text-xs font-semibold text-[#92400E] mb-1.5">
+                  Arxivga o‘tkaziladigan o‘quvchilar ({preview.toArchiveCount} nafar)
+                </div>
+                <div className="border border-[#E2E8F0] rounded-lg overflow-hidden max-h-36 overflow-y-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="bg-[#F1F5F9] text-[#334155]">
+                        <th className="py-1.5 px-3 w-24">Sinf</th>
+                        <th className="py-1.5 px-3">Familiya va ism</th>
+                        <th className="py-1.5 px-3 text-right">Faol qarz</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#E2E8F0]">
+                      {preview.sampleArchive.map((r, i) => (
+                        <tr key={`${r.className}-${r.fullName}-${i}`}>
+                          <td className="py-1.5 px-3 font-medium text-[#475569]">{r.className}</td>
+                          <td className="py-1.5 px-3 text-[#0F172A]">{r.fullName}</td>
+                          <td className="py-1.5 px-3 text-right tabular-nums">
+                            {r.activeLoans > 0 ? (
+                              <span className="text-[#DC2626] font-medium">{r.activeLoans} ta</span>
+                            ) : (
+                              <span className="text-[#94A3B8]">0</span>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            <div className="pt-2 flex justify-end gap-2 border-t border-[#E2E8F0]">
+              <Button variant="outline" onClick={() => setPreview(null)} disabled={busy}>
+                Bekor qilish
+              </Button>
+              <Button onClick={() => void handleConfirmReplace()} disabled={busy}>
+                {busy ? 'Yangilanmoqda...' : 'Tasdiqlash va yangilash'}
+              </Button>
+            </div>
+          </div>
+        )}
+      </ModalDialog>
+
+      {/* Rollback Confirmation Modal */}
+      <ModalDialog
+        open={rollbackOpen}
+        onOpenChange={setRollbackOpen}
+        title="Oxirgi importni bekor qilish"
+        description={
+          latestBackup
+            ? `${latestBackup.fileName} (${formatDateTimeTashkent(latestBackup.createdAt)}) importidan oldingi o‘quvchilar ro‘yxati tiklanadi. Kitob qarz tarixi saqlanadi.`
+            : ''
+        }
+      >
+        <div className="pt-2 flex justify-end gap-2">
+          <Button variant="outline" onClick={() => setRollbackOpen(false)} disabled={busy}>
+            Bekor qilish
+          </Button>
+          <Button onClick={() => void handleConfirmRollback()} disabled={busy}>
+            {busy ? 'Tiklanmoqda...' : 'Avvalgi ro‘yxatni tiklash'}
+          </Button>
+        </div>
+      </ModalDialog>
 
       {/* Add Student Modal */}
       <ModalDialog open={addOpen} onOpenChange={setAddOpen} title="Yangi o‘quvchi qo‘shish">
