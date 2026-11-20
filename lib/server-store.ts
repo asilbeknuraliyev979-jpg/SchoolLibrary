@@ -1,0 +1,1300 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import type {
+  ActivityLog,
+  BookTitle,
+  ImportBatch,
+  ImportPreviewResult,
+  InventoryIncident,
+  LibraryDatabase,
+  LibrarySettings,
+  Loan,
+  LoanExtension,
+  NotificationItem,
+  PhysicalCopy,
+  ReturnCondition,
+  ReviewIssueCode,
+  SourceInventoryRecord,
+  Student,
+} from './types';
+import { addDaysYmd, classifyLoanDeadline, getTodayTashkent, isValidYmd } from './date-utils';
+
+const DATA_DIR = path.resolve(process.cwd(), '.data');
+const DB_FILE = path.join(DATA_DIR, 'library-store.json');
+
+// Serialized promise queue to guarantee transactional consistency for concurrent requests
+let writeLock: Promise<unknown> = Promise.resolve();
+
+function uid(prefix: string): string {
+  return `${prefix}_${crypto.randomBytes(6).toString('hex')}`;
+}
+
+function defaultDatabase(): LibraryDatabase {
+  const now = new Date().toISOString();
+  return {
+    settings: {
+      schoolName: 'Kattaqo‘rg‘on tuman ixtisoslashtirilgan maktabi',
+      librarianName: 'Nodira',
+      defaultLoanDays: 14,
+      maxBooksPerStudent: 5,
+      timezone: 'Asia/Tashkent',
+      updatedAt: now,
+    },
+    students: [],
+    bookTitles: [],
+    physicalCopies: [],
+    importBatches: [],
+    sourceInventoryRecords: [],
+    loans: [],
+    loanExtensions: [],
+    inventoryIncidents: [],
+    notifications: [],
+    activityLogs: [],
+  };
+}
+
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+}
+
+export function readDb(): LibraryDatabase {
+  ensureDataDir();
+  if (!fs.existsSync(DB_FILE)) {
+    const initial = defaultDatabase();
+    writeDbAtomic(initial);
+    return initial;
+  }
+  const raw = fs.readFileSync(DB_FILE, 'utf8');
+  return JSON.parse(raw) as LibraryDatabase;
+}
+
+function writeDbAtomic(db: LibraryDatabase) {
+  ensureDataDir();
+  const tmp = `${DB_FILE}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(db));
+  fs.renameSync(tmp, DB_FILE);
+}
+
+/**
+ * Runs an atomic read-modify-write transaction serialized across concurrent API calls.
+ */
+export async function withDbTransaction<T>(fn: (db: LibraryDatabase) => T | Promise<T>): Promise<T> {
+  const next = writeLock.then(async () => {
+    const db = readDb();
+    const result = await fn(db);
+    writeDbAtomic(db);
+    return result;
+  });
+  writeLock = next.catch(() => {});
+  return next;
+}
+
+function addLog(
+  db: LibraryDatabase,
+  actorName: string,
+  action: string,
+  entityType: string,
+  entityId: string,
+  summary: string
+) {
+  const entry: ActivityLog = {
+    id: uid('log'),
+    action,
+    entityType,
+    entityId,
+    summary,
+    actorName,
+    createdAt: new Date().toISOString(),
+  };
+  db.activityLogs.unshift(entry);
+  if (db.activityLogs.length > 2000) {
+    db.activityLogs = db.activityLogs.slice(0, 2000);
+  }
+}
+
+function addNotification(
+  db: LibraryDatabase,
+  type: NotificationItem['type'],
+  title: string,
+  message: string,
+  link?: string
+) {
+  const item: NotificationItem = {
+    id: uid('ntf'),
+    type,
+    title,
+    message,
+    read: false,
+    link,
+    createdAt: new Date().toISOString(),
+  };
+  db.notifications.unshift(item);
+  if (db.notifications.length > 300) {
+    db.notifications = db.notifications.slice(0, 300);
+  }
+}
+
+function nextCopyCode(db: LibraryDatabase): string {
+  const num = db.physicalCopies.length + 1;
+  return `SL-${String(num).padStart(5, '0')}`;
+}
+
+function nextStudentCode(db: LibraryDatabase): string {
+  const num = db.students.length + 1;
+  return `OQ-${String(num).padStart(4, '0')}`;
+}
+
+/**
+ * Commits a parsed Inventar.xlsx preview idempotently into the database.
+ * IMPORTANT: Never fabricates physical copies from ambiguous ranges!
+ * Clear single-copy records can optionally be confirmed only when librarian explicitly chooses so;
+ * by default imported rows are preserved faithfully and unambiguous single items can be batch-confirmed.
+ */
+export async function commitInventoryImport(
+  preview: ImportPreviewResult,
+  options: { autoConfirmClearSingleCopies: boolean; actorName: string }
+): Promise<{ batch: ImportBatch; skippedDuplicateFile: boolean }> {
+  return withDbTransaction((db) => {
+    const existingBatch = db.importBatches.find((b) => b.fileChecksum === preview.fileChecksum);
+    if (existingBatch) {
+      return { batch: existingBatch, skippedDuplicateFile: true };
+    }
+
+    const now = new Date().toISOString();
+    const batchId = uid('batch');
+    let confirmedCount = 0;
+    let needsReviewCount = 0;
+
+    for (const row of preview.rows) {
+      const sourceId = uid('src');
+
+      if (
+        row.validationStatus === 'skipped_subtotal' ||
+        row.validationStatus === 'skipped_date_only' ||
+        row.validationStatus === 'skipped_empty'
+      ) {
+        const srcRec: SourceInventoryRecord = {
+          id: sourceId,
+          importBatchId: batchId,
+          sourceFileName: preview.fileName,
+          sourceSheet: preview.sheetName,
+          sourceRowNumber: row.sourceRowNumber,
+          rawColumns: row.rawColumns,
+          normalizedValues: {
+            title: '',
+            author: '',
+            publicationYear: null,
+            departmentCode: row.rawColumns.col8_department,
+            inventoryNumberRaw: row.rawColumns.col2_inventoryNumber,
+            isRange: false,
+          },
+          validationStatus: row.validationStatus,
+          issues: row.issues,
+          reviewNotes: row.reviewNotes,
+          bookTitleId: null,
+          importedAt: now,
+          updatedAt: now,
+        };
+        db.sourceInventoryRecords.push(srcRec);
+        continue;
+      }
+
+      const isClearSingle =
+        row.validationStatus === 'confirmed' && !row.isRange && Boolean(row.rawColumns.col2_inventoryNumber.trim());
+
+      const shouldConfirmNow = isClearSingle && options.autoConfirmClearSingleCopies;
+      const bookId = uid('book');
+
+      const book: BookTitle = {
+        id: bookId,
+        title: row.suggestedTitle || row.rawColumns.col4_authorTitle,
+        author: row.suggestedAuthor,
+        authorSplitConfidence: row.authorSplitConfidence,
+        originalAuthorTitle: row.rawColumns.col4_authorTitle,
+        inventoryNumberRaw: row.rawColumns.col2_inventoryNumber,
+        publicationYearRaw: row.rawColumns.col5_publicationYear,
+        publicationYear: row.publicationYear,
+        departmentCode: row.rawColumns.col8_department,
+        priceRaw: row.rawColumns.col6_price,
+        dateRecordedRaw: row.rawColumns.col1_dateCount,
+        reviewStatus: shouldConfirmNow ? 'confirmed' : 'needs_review',
+        reviewIssues: row.issues,
+        sourceRecordId: sourceId,
+        sourceRowNumber: row.sourceRowNumber,
+        isRangeRecord: row.isRange,
+        rangeStart: row.rangeStart,
+        rangeEnd: row.rangeEnd,
+        rangeConfirmed: false,
+        createdAt: now,
+        updatedAt: now,
+      };
+      db.bookTitles.push(book);
+
+      if (shouldConfirmNow) {
+        confirmedCount++;
+        const copyCode = nextCopyCode(db);
+        const copy: PhysicalCopy = {
+          id: uid('copy'),
+          bookTitleId: bookId,
+          internalCopyCode: copyCode,
+          originalInventoryNumber: row.rawColumns.col2_inventoryNumber,
+          barcode: copyCode,
+          status: 'available',
+          confirmed: true,
+          sourceRecordId: sourceId,
+          activeLoanId: null,
+          notes: `Import tasdiqlandi (${preview.fileName}, ${row.sourceRowNumber}-qator)`,
+          createdAt: now,
+          updatedAt: now,
+        };
+        db.physicalCopies.push(copy);
+      } else {
+        needsReviewCount++;
+      }
+
+      const srcRec: SourceInventoryRecord = {
+        id: sourceId,
+        importBatchId: batchId,
+        sourceFileName: preview.fileName,
+        sourceSheet: preview.sheetName,
+        sourceRowNumber: row.sourceRowNumber,
+        rawColumns: row.rawColumns,
+        normalizedValues: {
+          title: book.title,
+          author: book.author,
+          publicationYear: book.publicationYear,
+          departmentCode: book.departmentCode,
+          inventoryNumberRaw: book.inventoryNumberRaw,
+          isRange: book.isRangeRecord,
+        },
+        validationStatus: shouldConfirmNow ? 'confirmed' : 'needs_review',
+        issues: row.issues,
+        reviewNotes: row.reviewNotes,
+        bookTitleId: bookId,
+        importedAt: now,
+        updatedAt: now,
+      };
+      db.sourceInventoryRecords.push(srcRec);
+    }
+
+    const batch: ImportBatch = {
+      id: batchId,
+      fileName: preview.fileName,
+      sheetName: preview.sheetName,
+      fileChecksum: preview.fileChecksum,
+      totalRowsScanned: preview.totalRowsScanned,
+      bookRowsCount: preview.bookRowsCount,
+      confirmedCount,
+      needsReviewCount,
+      skippedCount: preview.skippedSubtotalCount + preview.skippedDateOnlyCount + preview.skippedEmptyCount,
+      skippedSubtotalCount: preview.skippedSubtotalCount,
+      skippedDateOnlyCount: preview.skippedDateOnlyCount,
+      duplicateInventoryCount: preview.duplicateInventoryCount,
+      rangeRecordCount: preview.rangeRecordCount,
+      invalidYearCount: preview.invalidYearCount,
+      missingInventoryCount: preview.missingInventoryCount,
+      errorCount: preview.errorCount,
+      status: 'completed',
+      createdAt: now,
+    };
+    db.importBatches.unshift(batch);
+
+    addLog(
+      db,
+      options.actorName,
+      'IMPORT_WORKBOOK',
+      'import_batch',
+      batchId,
+      `${preview.fileName} import qilindi: ${preview.bookRowsCount} kitob yozuvi (${confirmedCount} tasdiqlangan, ${needsReviewCount} tekshiruvda).`
+    );
+
+    if (needsReviewCount > 0) {
+      addNotification(
+        db,
+        'info',
+        'Inventar importi yakunlandi',
+        `${preview.fileName}: ${preview.bookRowsCount} ta yozuv yuklandi. ${needsReviewCount} ta yozuv tekshiruvni kutmoqda.`,
+        '/import'
+      );
+    }
+
+    return { batch, skippedDuplicateFile: false };
+  });
+}
+
+/**
+ * Batch-confirms clear non-range imported records that currently have 0 copies.
+ * NEVER touches ambiguous range records!
+ */
+export async function batchConfirmClearBooks(actorName: string): Promise<{ confirmedBooks: number; createdCopies: number }> {
+  return withDbTransaction((db) => {
+    const now = new Date().toISOString();
+    let confirmedBooks = 0;
+    let createdCopies = 0;
+
+    for (const book of db.bookTitles) {
+      if (book.reviewStatus !== 'needs_review') continue;
+      if (book.isRangeRecord) continue; // NEVER auto-confirm ranges
+      const blocking: ReviewIssueCode[] = ['range_ambiguous', 'invalid_year', 'missing_inventory_number'];
+      if (book.reviewIssues.some((i) => blocking.includes(i))) continue;
+
+      const existingCopies = db.physicalCopies.filter((c) => c.bookTitleId === book.id && c.confirmed);
+      if (existingCopies.length === 0) {
+        const copyCode = nextCopyCode(db);
+        db.physicalCopies.push({
+          id: uid('copy'),
+          bookTitleId: book.id,
+          internalCopyCode: copyCode,
+          originalInventoryNumber: book.inventoryNumberRaw,
+          barcode: copyCode,
+          status: 'available',
+          confirmed: true,
+          sourceRecordId: book.sourceRecordId,
+          activeLoanId: null,
+          notes: 'Ommaviy tasdiqlash orqali yaratilgan nusxa',
+          createdAt: now,
+          updatedAt: now,
+        });
+        createdCopies++;
+      }
+
+      book.reviewStatus = 'confirmed';
+      book.authorSplitConfidence = 'confirmed';
+      book.reviewIssues = book.reviewIssues.filter((i) => i === 'duplicate_inventory');
+      book.updatedAt = now;
+      confirmedBooks++;
+
+      if (book.sourceRecordId) {
+        const src = db.sourceInventoryRecords.find((s) => s.id === book.sourceRecordId);
+        if (src) {
+          src.validationStatus = 'confirmed';
+          src.updatedAt = now;
+        }
+      }
+    }
+
+    if (confirmedBooks > 0) {
+      addLog(
+        db,
+        actorName,
+        'BATCH_CONFIRM_INVENTORY',
+        'book_title',
+        'batch',
+        `${confirmedBooks} ta aniq inventar yozuvi tasdiqlandi va ${createdCopies} ta fizik nusxa yaratildi.`
+      );
+    }
+
+    return { confirmedBooks, createdCopies };
+  });
+}
+
+/**
+ * Confirms an inventory range record with an explicit copy count chosen by the librarian.
+ */
+export async function confirmBookRange(
+  bookId: string,
+  copyCount: number,
+  inventoryLabels: string[] | null,
+  actorName: string
+): Promise<{ book: BookTitle; createdCopies: PhysicalCopy[] }> {
+  if (!Number.isInteger(copyCount) || copyCount < 1 || copyCount > 300) {
+    throw new Error('Nusxalar soni 1 dan 300 gacha butun son bo‘lishi kerak.');
+  }
+
+  return withDbTransaction((db) => {
+    const book = db.bookTitles.find((b) => b.id === bookId);
+    if (!book) throw new Error('Kitob topilmadi.');
+
+    const now = new Date().toISOString();
+    const createdCopies: PhysicalCopy[] = [];
+    const startNum = book.rangeStart ?? 1;
+
+    for (let i = 0; i < copyCount; i++) {
+      const copyCode = nextCopyCode(db);
+      const origInv =
+        inventoryLabels?.[i] ??
+        (book.isRangeRecord && book.rangeStart !== null
+          ? `${book.inventoryNumberRaw} (#${startNum + i})`
+          : book.inventoryNumberRaw || copyCode);
+      const copy: PhysicalCopy = {
+        id: uid('copy'),
+        bookTitleId: book.id,
+        internalCopyCode: copyCode,
+        originalInventoryNumber: origInv,
+        barcode: copyCode,
+        status: 'available',
+        confirmed: true,
+        sourceRecordId: book.sourceRecordId,
+        activeLoanId: null,
+        notes: book.isRangeRecord
+          ? `Diapazon (${book.inventoryNumberRaw}) tasdiqlanganda yaratilgan (${i + 1}/${copyCount})`
+          : 'Kutubxonachi tomonidan qo‘shilgan tasdiqlangan nusxa',
+        createdAt: now,
+        updatedAt: now,
+      };
+      db.physicalCopies.push(copy);
+      createdCopies.push(copy);
+    }
+
+    book.rangeConfirmed = true;
+    book.reviewStatus = 'confirmed';
+    book.reviewIssues = book.reviewIssues.filter((x) => x !== 'range_ambiguous');
+    book.updatedAt = now;
+
+    if (book.sourceRecordId) {
+      const src = db.sourceInventoryRecords.find((s) => s.id === book.sourceRecordId);
+      if (src) {
+        src.validationStatus = 'confirmed';
+        src.reviewNotes = `Kutubxonachi ${copyCount} ta fizik nusxani tasdiqladi.`;
+        src.updatedAt = now;
+      }
+    }
+
+    addLog(
+      db,
+      actorName,
+      'CONFIRM_RANGE_COPIES',
+      'book_title',
+      book.id,
+      `"${book.title}" (${book.inventoryNumberRaw || '—'}) uchun ${copyCount} ta tasdiqlangan fizik nusxa yaratildi.`
+    );
+
+    return { book, createdCopies };
+  });
+}
+
+export async function createBookManually(
+  input: {
+    title: string;
+    author: string;
+    inventoryNumberRaw: string;
+    publicationYear: number | null;
+    departmentCode: string;
+    priceRaw?: string;
+    initialCopies: number;
+  },
+  actorName: string
+): Promise<{ book: BookTitle; copies: PhysicalCopy[] }> {
+  const title = input.title.trim();
+  if (!title) throw new Error('Kitob nomi kiritilishi shart.');
+  if (!Number.isInteger(input.initialCopies) || input.initialCopies < 0 || input.initialCopies > 200) {
+    throw new Error('Nusxalar soni 0 dan 200 gacha bo‘lishi kerak.');
+  }
+
+  return withDbTransaction((db) => {
+    const now = new Date().toISOString();
+    const bookId = uid('book');
+    const book: BookTitle = {
+      id: bookId,
+      title,
+      author: input.author.trim(),
+      authorSplitConfidence: 'confirmed',
+      originalAuthorTitle: input.author.trim() ? `${title} ${input.author.trim()}` : title,
+      inventoryNumberRaw: input.inventoryNumberRaw.trim(),
+      publicationYearRaw: input.publicationYear ? String(input.publicationYear) : '',
+      publicationYear: input.publicationYear,
+      departmentCode: input.departmentCode.trim(),
+      priceRaw: input.priceRaw?.trim() ?? '',
+      dateRecordedRaw: getTodayTashkent(),
+      reviewStatus: 'confirmed',
+      reviewIssues: [],
+      sourceRecordId: null,
+      sourceRowNumber: null,
+      isRangeRecord: false,
+      rangeStart: null,
+      rangeEnd: null,
+      rangeConfirmed: true,
+      createdAt: now,
+      updatedAt: now,
+    };
+    db.bookTitles.unshift(book);
+
+    const copies: PhysicalCopy[] = [];
+    for (let i = 0; i < input.initialCopies; i++) {
+      const code = nextCopyCode(db);
+      const copy: PhysicalCopy = {
+        id: uid('copy'),
+        bookTitleId: bookId,
+        internalCopyCode: code,
+        originalInventoryNumber:
+          input.initialCopies > 1 && input.inventoryNumberRaw.trim()
+            ? `${input.inventoryNumberRaw.trim()}-${i + 1}`
+            : input.inventoryNumberRaw.trim() || code,
+        barcode: code,
+        status: 'available',
+        confirmed: true,
+        sourceRecordId: null,
+        activeLoanId: null,
+        notes: 'Qo‘lda qo‘shilgan tasdiqlangan nusxa',
+        createdAt: now,
+        updatedAt: now,
+      };
+      db.physicalCopies.push(copy);
+      copies.push(copy);
+    }
+
+    addLog(
+      db,
+      actorName,
+      'CREATE_BOOK',
+      'book_title',
+      bookId,
+      `Yangi kitob qo‘shildi: "${book.title}" (${copies.length} ta tasdiqlangan nusxa).`
+    );
+
+    return { book, copies };
+  });
+}
+
+export async function updateBookMetadata(
+  bookId: string,
+  patch: {
+    title?: string;
+    author?: string;
+    publicationYear?: number | null;
+    departmentCode?: string;
+    reviewStatus?: BookTitle['reviewStatus'];
+    inventoryNumberRaw?: string;
+    clearIssue?: ReviewIssueCode;
+  },
+  actorName: string
+): Promise<BookTitle> {
+  return withDbTransaction((db) => {
+    const book = db.bookTitles.find((b) => b.id === bookId);
+    if (!book) throw new Error('Kitob topilmadi.');
+
+    const now = new Date().toISOString();
+    if (patch.title !== undefined && patch.title.trim()) book.title = patch.title.trim();
+    if (patch.author !== undefined) {
+      book.author = patch.author.trim();
+      book.authorSplitConfidence = 'confirmed';
+      book.reviewIssues = book.reviewIssues.filter((i) => i !== 'uncertain_author_split');
+    }
+    if (patch.publicationYear !== undefined) {
+      book.publicationYear = patch.publicationYear;
+      if (patch.publicationYear !== null && patch.publicationYear >= 1900 && patch.publicationYear <= 2026) {
+        book.reviewIssues = book.reviewIssues.filter((i) => i !== 'invalid_year' && i !== 'missing_year');
+      }
+    }
+    if (patch.departmentCode !== undefined) book.departmentCode = patch.departmentCode.trim();
+    if (patch.inventoryNumberRaw !== undefined) {
+      book.inventoryNumberRaw = patch.inventoryNumberRaw.trim();
+      if (book.inventoryNumberRaw) {
+        book.reviewIssues = book.reviewIssues.filter((i) => i !== 'missing_inventory_number');
+      }
+    }
+    if (patch.clearIssue) {
+      book.reviewIssues = book.reviewIssues.filter((i) => i !== patch.clearIssue);
+    }
+    if (patch.reviewStatus) {
+      book.reviewStatus = patch.reviewStatus;
+    }
+    book.updatedAt = now;
+
+    // Never overwrite sourceInventoryRecords.rawColumns! Only update normalizedValues.
+    if (book.sourceRecordId) {
+      const src = db.sourceInventoryRecords.find((s) => s.id === book.sourceRecordId);
+      if (src) {
+        src.normalizedValues = {
+          title: book.title,
+          author: book.author,
+          publicationYear: book.publicationYear,
+          departmentCode: book.departmentCode,
+          inventoryNumberRaw: book.inventoryNumberRaw,
+          isRange: book.isRangeRecord,
+        };
+        src.validationStatus = book.reviewStatus === 'confirmed' ? 'confirmed' : src.validationStatus;
+        src.updatedAt = now;
+      }
+    }
+
+    addLog(
+      db,
+      actorName,
+      'UPDATE_BOOK',
+      'book_title',
+      book.id,
+      `"${book.title}" ma’lumotlari yangilandi (asl inventar yozuvi o‘zgarishsiz saqlandi).`
+    );
+
+    return book;
+  });
+}
+
+export async function mergeBookTitles(
+  primaryBookId: string,
+  duplicateBookId: string,
+  actorName: string
+): Promise<BookTitle> {
+  if (primaryBookId === duplicateBookId) {
+    throw new Error('Bir xil kitobni o‘zi bilan birlashtirib bo‘lmaydi.');
+  }
+  return withDbTransaction((db) => {
+    const primary = db.bookTitles.find((b) => b.id === primaryBookId);
+    const dup = db.bookTitles.find((b) => b.id === duplicateBookId);
+    if (!primary || !dup) throw new Error('Kitoblardan biri topilmadi.');
+
+    const now = new Date().toISOString();
+    let movedCopies = 0;
+    for (const c of db.physicalCopies) {
+      if (c.bookTitleId === dup.id) {
+        c.bookTitleId = primary.id;
+        c.updatedAt = now;
+        movedCopies++;
+      }
+    }
+    for (const l of db.loans) {
+      if (l.bookTitleId === dup.id) {
+        l.bookTitleId = primary.id;
+        l.updatedAt = now;
+      }
+    }
+    dup.reviewStatus = 'archived';
+    dup.updatedAt = now;
+
+    addLog(
+      db,
+      actorName,
+      'MERGE_BOOKS',
+      'book_title',
+      primary.id,
+      `"${dup.title}" (${dup.inventoryNumberRaw || dup.id}) yozuvi "${primary.title}" bilan birlashtirildi (${movedCopies} ta nusxa ko‘chirildi).`
+    );
+
+    return primary;
+  });
+}
+
+export async function createStudent(
+  input: {
+    fullName: string;
+    className: string;
+    schoolStudentNumber?: string;
+    notes?: string;
+  },
+  actorName: string
+): Promise<Student> {
+  const fullName = input.fullName.trim();
+  const className = input.className.trim();
+  if (fullName.length < 2) throw new Error('O‘quvchi F.I.Sh. kamida 2 ta belgidan iborat bo‘lishi kerak.');
+  if (!className) throw new Error('Sinf nomi kiritilishi shart (masalan: 8a1, 9t).');
+
+  return withDbTransaction((db) => {
+    const now = new Date().toISOString();
+    const student: Student = {
+      id: uid('stu'),
+      internalStudentId: nextStudentCode(db),
+      schoolStudentNumber: input.schoolStudentNumber?.trim() ?? '',
+      fullName,
+      className,
+      registeredAt: getTodayTashkent(),
+      status: 'active',
+      notes: input.notes?.trim() ?? '',
+      createdAt: now,
+      updatedAt: now,
+    };
+    db.students.unshift(student);
+
+    addLog(
+      db,
+      actorName,
+      'CREATE_STUDENT',
+      'student',
+      student.id,
+      `Yangi o‘quvchi ro‘yxatga olindi: ${student.fullName} (${student.className}, ID: ${student.internalStudentId}).`
+    );
+
+    return student;
+  });
+}
+
+export async function updateStudent(
+  studentId: string,
+  patch: {
+    fullName?: string;
+    className?: string;
+    schoolStudentNumber?: string;
+    status?: 'active' | 'archived';
+    notes?: string;
+  },
+  actorName: string
+): Promise<Student> {
+  return withDbTransaction((db) => {
+    const student = db.students.find((s) => s.id === studentId);
+    if (!student) throw new Error('O‘quvchi topilmadi.');
+
+    if (patch.status === 'archived') {
+      const hasActiveLoans = db.loans.some((l) => l.studentId === student.id && l.status === 'active');
+      if (hasActiveLoans) {
+        throw new Error('Qo‘lida qaytarilmagan kitobi bor o‘quvchini arxivlab bo‘lmaydi.');
+      }
+    }
+
+    if (patch.fullName !== undefined && patch.fullName.trim()) student.fullName = patch.fullName.trim();
+    if (patch.className !== undefined && patch.className.trim()) student.className = patch.className.trim();
+    if (patch.schoolStudentNumber !== undefined) student.schoolStudentNumber = patch.schoolStudentNumber.trim();
+    if (patch.status !== undefined) student.status = patch.status;
+    if (patch.notes !== undefined) student.notes = patch.notes.trim();
+    student.updatedAt = new Date().toISOString();
+
+    addLog(
+      db,
+      actorName,
+      'UPDATE_STUDENT',
+      'student',
+      student.id,
+      `O‘quvchi ma’lumotlari yangilandi: ${student.fullName} (${student.className}).`
+    );
+    return student;
+  });
+}
+
+export async function bulkImportStudents(
+  rows: Array<{ fullName: string; className: string; schoolStudentNumber?: string }>,
+  actorName: string
+): Promise<{ imported: number; skipped: number }> {
+  return withDbTransaction((db) => {
+    const now = new Date().toISOString();
+    const today = getTodayTashkent();
+    let imported = 0;
+    let skipped = 0;
+
+    const existingKeys = new Set<string>(
+      db.students
+        .filter((s) => s.status === 'active')
+        .map((s) => `${s.className.trim().toLowerCase()}::${s.fullName.trim().toLowerCase()}`)
+    );
+
+    let maxCode = 0;
+    for (const s of db.students) {
+      const m = /^STU-(\d+)$/.exec(s.internalStudentId);
+      if (m) {
+        const n = Number(m[1]);
+        if (n > maxCode) maxCode = n;
+      }
+    }
+
+    for (const r of rows) {
+      const fullName = r.fullName.trim();
+      const className = r.className.trim();
+      if (!fullName || !className) {
+        skipped++;
+        continue;
+      }
+      const key = `${className.toLowerCase()}::${fullName.toLowerCase()}`;
+      if (existingKeys.has(key)) {
+        skipped++;
+        continue;
+      }
+      existingKeys.add(key);
+      maxCode += 1;
+      db.students.push({
+        id: uid('stu'),
+        internalStudentId: `STU-${String(maxCode).padStart(4, '0')}`,
+        schoolStudentNumber: r.schoolStudentNumber?.trim() ?? '',
+        fullName,
+        className,
+        registeredAt: today,
+        status: 'active',
+        notes: 'XLSX orqali import qilingan',
+        createdAt: now,
+        updatedAt: now,
+      });
+      imported++;
+    }
+
+    if (imported > 0) {
+      addLog(
+        db,
+        actorName,
+        'IMPORT_STUDENTS',
+        'student',
+        'batch',
+        `${imported} nafar o‘quvchi XLSX fayldan import qilindi (${skipped} ta takroriy o‘tkazib yuborildi).`
+      );
+    }
+
+    return { imported, skipped };
+  });
+}
+
+/**
+ * Atomically issues one or more confirmed available physical copies to a student.
+ * Strictly prevents double-issuing and enforces configurable borrowing limits.
+ */
+export async function issueLoansTransactional(
+  input: {
+    studentId: string;
+    physicalCopyIds: string[];
+    issuedDate?: string;
+    dueDate: string;
+    notes?: string;
+  },
+  actorName: string
+): Promise<Loan[]> {
+  const uniqueCopyIds = Array.from(new Set(input.physicalCopyIds));
+  if (uniqueCopyIds.length === 0) {
+    throw new Error('Kamida bitta tasdiqlangan kitob nusxasini tanlang.');
+  }
+  const issuedDate = input.issuedDate || getTodayTashkent();
+  if (!isValidYmd(issuedDate) || !isValidYmd(input.dueDate)) {
+    throw new Error('Berilgan yoki qaytarish sanasi noto‘g‘ri formatda.');
+  }
+  if (input.dueDate < issuedDate) {
+    throw new Error('Qaytarish sanasi berilgan sanadan oldin bo‘lishi mumkin emas.');
+  }
+
+  return withDbTransaction((db) => {
+    const student = db.students.find((s) => s.id === input.studentId && s.status === 'active');
+    if (!student) throw new Error('Faol o‘quvchi topilmadi.');
+
+    const currentActiveCount = db.loans.filter(
+      (l) => l.studentId === student.id && l.status === 'active'
+    ).length;
+
+    if (currentActiveCount + uniqueCopyIds.length > db.settings.maxBooksPerStudent) {
+      throw new Error(
+        `O‘quvchi bir vaqtda ko‘pi bilan ${db.settings.maxBooksPerStudent} ta kitob olishi mumkin (hozir qo‘lida: ${currentActiveCount} ta).`
+      );
+    }
+
+    // Validate EVERY copy before mutating anything (atomic all-or-nothing!)
+    const resolvedCopies: Array<{ copy: PhysicalCopy; book: BookTitle }> = [];
+    for (const copyId of uniqueCopyIds) {
+      const copy = db.physicalCopies.find((c) => c.id === copyId);
+      if (!copy) throw new Error(`Nusxa topilmadi (${copyId}).`);
+      if (!copy.confirmed) {
+        throw new Error(`Nusxa (${copy.internalCopyCode}) hali tasdiqlanmagan — berish mumkin emas.`);
+      }
+      if (copy.status !== 'available' || copy.activeLoanId) {
+        throw new Error(`Nusxa (${copy.internalCopyCode}) hozir mavjud emas (holati: ${copy.status}).`);
+      }
+      const existingActive = db.loans.find((l) => l.physicalCopyId === copy.id && l.status === 'active');
+      if (existingActive) {
+        throw new Error(`Nusxa (${copy.internalCopyCode}) allaqachon boshqa o‘quvchiga berilgan!`);
+      }
+      const book = db.bookTitles.find((b) => b.id === copy.bookTitleId);
+      if (!book) throw new Error('Nusxaga bog‘langan kitob topilmadi.');
+      resolvedCopies.push({ copy, book });
+    }
+
+    const now = new Date().toISOString();
+    const createdLoans: Loan[] = [];
+
+    for (const { copy, book } of resolvedCopies) {
+      const loanId = uid('loan');
+      const loan: Loan = {
+        id: loanId,
+        studentId: student.id,
+        bookTitleId: book.id,
+        physicalCopyId: copy.id,
+        issuedDate,
+        dueDate: input.dueDate,
+        returnedDate: null,
+        status: 'active',
+        returnCondition: null,
+        notes: input.notes?.trim() ?? '',
+        createdAt: now,
+        updatedAt: now,
+      };
+      db.loans.unshift(loan);
+      copy.status = 'issued';
+      copy.activeLoanId = loanId;
+      copy.updatedAt = now;
+      createdLoans.push(loan);
+
+      addLog(
+        db,
+        actorName,
+        'ISSUE_BOOK',
+        'loan',
+        loanId,
+        `${student.fullName} (${student.className}) ga "${book.title}" [${copy.internalCopyCode}] berildi. Qaytarish: ${input.dueDate}.`
+      );
+    }
+
+    return createdLoans;
+  });
+}
+
+/**
+ * Class-level bulk textbook distribution.
+ * Strictly maps unique student -> unique available physical copy.
+ */
+export async function issueClassBulkDistribution(
+  input: {
+    assignments: Array<{ studentId: string; physicalCopyId: string }>;
+    issuedDate?: string;
+    dueDate: string;
+    notes?: string;
+  },
+  actorName: string
+): Promise<Loan[]> {
+  if (input.assignments.length === 0) {
+    throw new Error('Kamida bitta o‘quvchi-nusxa biriktirilishi kerak.');
+  }
+  const issuedDate = input.issuedDate || getTodayTashkent();
+  if (!isValidYmd(issuedDate) || !isValidYmd(input.dueDate) || input.dueDate < issuedDate) {
+    throw new Error('Sana parametrlari noto‘g‘ri.');
+  }
+
+  // Ensure no physical copy is assigned to two students!
+  const seenCopies = new Set<string>();
+  for (const a of input.assignments) {
+    if (seenCopies.has(a.physicalCopyId)) {
+      throw new Error('Bitta fizik nusxani ikki o‘quvchiga bir vaqtda biriktirib bo‘lmaydi.');
+    }
+    seenCopies.add(a.physicalCopyId);
+  }
+
+  return withDbTransaction((db) => {
+    const validated: Array<{ student: Student; copy: PhysicalCopy; book: BookTitle }> = [];
+    for (const a of input.assignments) {
+      const student = db.students.find((s) => s.id === a.studentId && s.status === 'active');
+      if (!student) throw new Error(`Faol o‘quvchi topilmadi (${a.studentId}).`);
+      const copy = db.physicalCopies.find((c) => c.id === a.physicalCopyId);
+      if (!copy || !copy.confirmed || copy.status !== 'available' || copy.activeLoanId) {
+        throw new Error(`Nusxa (${copy?.internalCopyCode ?? a.physicalCopyId}) berish uchun mavjud emas.`);
+      }
+      const book = db.bookTitles.find((b) => b.id === copy.bookTitleId);
+      if (!book) throw new Error('Kitob topilmadi.');
+      validated.push({ student, copy, book });
+    }
+
+    const now = new Date().toISOString();
+    const created: Loan[] = [];
+
+    for (const { student, copy, book } of validated) {
+      const loanId = uid('loan');
+      const loan: Loan = {
+        id: loanId,
+        studentId: student.id,
+        bookTitleId: book.id,
+        physicalCopyId: copy.id,
+        issuedDate,
+        dueDate: input.dueDate,
+        returnedDate: null,
+        status: 'active',
+        returnCondition: null,
+        notes: input.notes?.trim() || 'Sinf bo‘yicha ommaviy tarqatish',
+        createdAt: now,
+        updatedAt: now,
+      };
+      db.loans.unshift(loan);
+      copy.status = 'issued';
+      copy.activeLoanId = loanId;
+      copy.updatedAt = now;
+      created.push(loan);
+    }
+
+    addLog(
+      db,
+      actorName,
+      'CLASS_BULK_ISSUE',
+      'loan',
+      created[0]?.id ?? 'bulk',
+      `Sinf bo‘yicha ommaviy tarqatish: ${created.length} ta kitob nusxasi berildi (qaytarish: ${input.dueDate}).`
+    );
+
+    return created;
+  });
+}
+
+/**
+ * Atomically returns a loaned book, restoring availability ONLY if returned in good condition.
+ * Damaged or lost returns create an InventoryIncident and mark the copy damaged/lost.
+ */
+export async function returnLoanTransactional(
+  input: {
+    loanId: string;
+    returnedDate?: string;
+    condition: ReturnCondition;
+    notes?: string;
+  },
+  actorName: string
+): Promise<{ loan: Loan; copy: PhysicalCopy; incident: InventoryIncident | null }> {
+  const returnedDate = input.returnedDate || getTodayTashkent();
+  if (!isValidYmd(returnedDate)) {
+    throw new Error('Qaytarish sanasi noto‘g‘ri formatda.');
+  }
+
+  return withDbTransaction((db) => {
+    const loan = db.loans.find((l) => l.id === input.loanId);
+    if (!loan) throw new Error('Berilgan kitob yozuvi topilmadi.');
+    if (loan.status !== 'active') throw new Error('Bu kitob allaqachon qaytarilgan.');
+
+    const copy = db.physicalCopies.find((c) => c.id === loan.physicalCopyId);
+    if (!copy) throw new Error('Bog‘langan fizik nusxa topilmadi.');
+
+    const student = db.students.find((s) => s.id === loan.studentId);
+    const book = db.bookTitles.find((b) => b.id === loan.bookTitleId);
+    const now = new Date().toISOString();
+
+    loan.status = 'returned';
+    loan.returnedDate = returnedDate;
+    loan.returnCondition = input.condition;
+    if (input.notes?.trim()) {
+      loan.notes = loan.notes ? `${loan.notes} | Qaytarish: ${input.notes.trim()}` : input.notes.trim();
+    }
+    loan.updatedAt = now;
+
+    copy.activeLoanId = null;
+    copy.updatedAt = now;
+
+    let incident: InventoryIncident | null = null;
+    if (input.condition === 'good') {
+      copy.status = 'available';
+    } else {
+      copy.status = input.condition; // 'damaged' | 'lost'
+      incident = {
+        id: uid('inc'),
+        physicalCopyId: copy.id,
+        bookTitleId: loan.bookTitleId,
+        loanId: loan.id,
+        studentId: loan.studentId,
+        incidentType: input.condition,
+        notes: input.notes?.trim() || (input.condition === 'damaged' ? 'Shikastlangan holda qaytarildi' : 'Kitob yo‘qolgan deb qayd etildi'),
+        resolved: false,
+        createdAt: now,
+        updatedAt: now,
+      };
+      db.inventoryIncidents.unshift(incident);
+      addNotification(
+        db,
+        'incident',
+        input.condition === 'damaged' ? 'Shikastlangan kitob qayd etildi' : 'Yo‘qolgan kitob qayd etildi',
+        `${student?.fullName ?? 'O‘quvchi'} — "${book?.title ?? 'Kitob'}" [${copy.internalCopyCode}]`,
+        '/catalog'
+      );
+    }
+
+    const condLabel =
+      input.condition === 'good'
+        ? 'Yaxshi holatda'
+        : input.condition === 'damaged'
+          ? 'Shikastlangan'
+          : 'Yo‘qolgan';
+
+    addLog(
+      db,
+      actorName,
+      'RETURN_BOOK',
+      'loan',
+      loan.id,
+      `${student?.fullName ?? 'O‘quvchi'} "${book?.title ?? 'Kitob'}" [${copy.internalCopyCode}] kitobini qaytardi (${condLabel}).`
+    );
+
+    return { loan, copy, incident };
+  });
+}
+
+export async function extendLoanDeadline(
+  input: {
+    loanId: string;
+    newDueDate: string;
+    reason: string;
+  },
+  actorName: string
+): Promise<{ loan: Loan; extension: LoanExtension }> {
+  if (!isValidYmd(input.newDueDate)) throw new Error('Yangi qaytarish sanasi noto‘g‘ri.');
+  if (input.reason.trim().length < 2) throw new Error('Muddatni uzaytirish sababini kiriting.');
+
+  return withDbTransaction((db) => {
+    const loan = db.loans.find((l) => l.id === input.loanId);
+    if (!loan || loan.status !== 'active') throw new Error('Faol qarz yozuvi topilmadi.');
+    if (input.newDueDate <= loan.dueDate) {
+      throw new Error('Yangi muddat joriy qaytarish sanasidan keyinroq bo‘lishi kerak.');
+    }
+
+    const now = new Date().toISOString();
+    const ext: LoanExtension = {
+      id: uid('ext'),
+      loanId: loan.id,
+      previousDueDate: loan.dueDate,
+      newDueDate: input.newDueDate,
+      reason: input.reason.trim(),
+      actorName,
+      createdAt: now,
+    };
+    db.loanExtensions.unshift(ext);
+    loan.dueDate = input.newDueDate;
+    loan.updatedAt = now;
+
+    addLog(
+      db,
+      actorName,
+      'EXTEND_LOAN',
+      'loan',
+      loan.id,
+      `Qaytarish muddati ${ext.previousDueDate} dan ${ext.newDueDate} ga uzaytirildi. Sabab: ${ext.reason}`
+    );
+
+    return { loan, extension: ext };
+  });
+}
+
+export async function updateLibrarySettings(
+  patch: Partial<Pick<LibrarySettings, 'schoolName' | 'librarianName' | 'defaultLoanDays' | 'maxBooksPerStudent'>>,
+  actorName: string
+): Promise<LibrarySettings> {
+  return withDbTransaction((db) => {
+    if (patch.schoolName !== undefined && patch.schoolName.trim()) {
+      db.settings.schoolName = patch.schoolName.trim();
+    }
+    if (patch.librarianName !== undefined && patch.librarianName.trim()) {
+      db.settings.librarianName = patch.librarianName.trim();
+    }
+    if (patch.defaultLoanDays !== undefined) {
+      const days = Number(patch.defaultLoanDays);
+      if (!Number.isInteger(days) || days < 1 || days > 365) {
+        throw new Error('Standart muddat 1 dan 365 kungacha bo‘lishi kerak.');
+      }
+      db.settings.defaultLoanDays = days;
+    }
+    if (patch.maxBooksPerStudent !== undefined) {
+      const max = Number(patch.maxBooksPerStudent);
+      if (!Number.isInteger(max) || max < 1 || max > 50) {
+        throw new Error('O‘quvchi uchun maksimal kitoblar soni 1 dan 50 gacha bo‘lishi kerak.');
+      }
+      db.settings.maxBooksPerStudent = max;
+    }
+    db.settings.updatedAt = new Date().toISOString();
+
+    addLog(db, actorName, 'UPDATE_SETTINGS', 'settings', 'library_settings', 'Kutubxona sozlamalari yangilandi.');
+    return db.settings;
+  });
+}
+
+export async function markNotificationRead(id: string | 'all'): Promise<void> {
+  await withDbTransaction((db) => {
+    for (const n of db.notifications) {
+      if (id === 'all' || n.id === id) {
+        n.read = true;
+      }
+    }
+  });
+}
+
+/**
+ * Generates live smart notifications (today's returns, upcoming 3 days, overdue) dynamically
+ * combined with persisted incident/import notifications.
+ */
+export function computeSmartNotifications(db: LibraryDatabase): NotificationItem[] {
+  const today = getTodayTashkent();
+  const dynamic: NotificationItem[] = [];
+  const studentMap = new Map(db.students.map((s) => [s.id, s]));
+  const bookMap = new Map(db.bookTitles.map((b) => [b.id, b]));
+
+  const activeLoans = db.loans.filter((l) => l.status === 'active');
+  const overdue = activeLoans.filter((l) => classifyLoanDeadline(l, today).bucket === 'overdue');
+  const dueToday = activeLoans.filter((l) => classifyLoanDeadline(l, today).bucket === 'due_today');
+  const dueSoon = activeLoans.filter((l) => {
+    const b = classifyLoanDeadline(l, today).bucket;
+    return b === 'due_tomorrow' || b === 'due_soon_3d';
+  });
+
+  if (overdue.length > 0) {
+    const first = overdue[0];
+    dynamic.push({
+      id: `dyn_overdue_${today}`,
+      type: 'overdue',
+      title: `${overdue.length} ta kitobning muddati o‘tgan`,
+      message: `${studentMap.get(first.studentId)?.fullName ?? 'O‘quvchi'} — "${bookMap.get(first.bookTitleId)?.title ?? 'Kitob'}" va boshqalar.`,
+      read: false,
+      link: '/deadlines',
+      createdAt: new Date().toISOString(),
+    });
+  }
+  if (dueToday.length > 0) {
+    dynamic.push({
+      id: `dyn_today_${today}`,
+      type: 'due_today',
+      title: `Bugun ${dueToday.length} ta kitob qaytarilishi kerak`,
+      message: `Qaytarish muddatlari bo‘limida bugungi ro‘yxatni ko‘ring.`,
+      read: false,
+      link: '/deadlines',
+      createdAt: new Date().toISOString(),
+    });
+  }
+  if (dueSoon.length > 0) {
+    dynamic.push({
+      id: `dyn_soon_${today}`,
+      type: 'upcoming',
+      title: `Yaqin 3 kunda ${dueSoon.length} ta qaytarish kutilmoqda`,
+      message: `O‘quvchilarga eslatma berish uchun muddatlar jadvalini tekshiring.`,
+      read: false,
+      link: '/deadlines',
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  return [...dynamic, ...db.notifications.slice(0, 30)];
+}
+
+export function buildDashboardSummary(db: LibraryDatabase) {
+  const today = getTodayTashkent();
+  const confirmedCopies = db.physicalCopies.filter((c) => c.confirmed && c.status !== 'archived');
+  const availableCopies = confirmedCopies.filter((c) => c.status === 'available');
+  const issuedCopies = confirmedCopies.filter((c) => c.status === 'issued');
+  const activeLoans = db.loans.filter((l) => l.status === 'active');
+  const dueToday = activeLoans.filter((l) => classifyLoanDeadline(l, today).bucket === 'due_today');
+  const overdue = activeLoans.filter((l) => classifyLoanDeadline(l, today).bucket === 'overdue');
+  const activeStudentsWithLoans = new Set(activeLoans.map((l) => l.studentId));
+  const booksNeedingReview = db.bookTitles.filter((b) => b.reviewStatus === 'needs_review');
+
+  // 14-day daily issue/return activity chart from REAL loans
+  const activitySeries: Array<{ date: string; label: string; berilgan: number; qaytarilgan: number }> = [];
+  for (let i = 13; i >= 0; i--) {
+    const d = addDaysYmd(today, -i);
+    const issuedCount = db.loans.filter((l) => l.issuedDate === d).length;
+    const returnedCount = db.loans.filter((l) => l.returnedDate === d).length;
+    activitySeries.push({
+      date: d,
+      label: `${d.slice(8, 10)}.${d.slice(5, 7)}`,
+      berilgan: issuedCount,
+      qaytarilgan: returnedCount,
+    });
+  }
+
+  // Most borrowed books from REAL loans
+  const borrowCounts = new Map<string, number>();
+  for (const l of db.loans) {
+    borrowCounts.set(l.bookTitleId, (borrowCounts.get(l.bookTitleId) ?? 0) + 1);
+  }
+  const topBooks = Array.from(borrowCounts.entries())
+    .map(([bookTitleId, count]) => {
+      const book = db.bookTitles.find((b) => b.id === bookTitleId);
+      return {
+        bookTitleId,
+        title: book?.title ?? 'Noma’lum kitob',
+        author: book?.author ?? '',
+        count,
+      };
+    })
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 8);
+
+  return {
+    today,
+    stats: {
+      totalConfirmedCopies: confirmedCopies.length,
+      availableCopies: availableCopies.length,
+      issuedCopies: issuedCopies.length,
+      dueTodayCount: dueToday.length,
+      overdueCount: overdue.length,
+      activeBorrowersCount: activeStudentsWithLoans.size,
+      totalCatalogRecords: db.bookTitles.filter((b) => b.reviewStatus !== 'archived').length,
+      needsReviewCount: booksNeedingReview.length,
+      totalStudents: db.students.filter((s) => s.status === 'active').length,
+    },
+    dueTodayLoans: dueToday.slice(0, 10),
+    overdueLoans: overdue.slice(0, 10),
+    recentActivities: db.activityLogs.slice(0, 12),
+    activitySeries,
+    topBooks,
+    reviewSample: booksNeedingReview.slice(0, 10),
+  };
+}

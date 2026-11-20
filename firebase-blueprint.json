@@ -1,0 +1,268 @@
+{
+  "entities": {
+    "LibrarianProfile": {
+      "title": "LibrarianProfile",
+      "description": "Authenticated librarian profile for School Library",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "username": { "type": "string", "minLength": 2, "maxLength": 64 },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "role": { "type": "string", "enum": ["librarian", "admin"] },
+        "schoolName": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "mustChangePassword": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "username", "displayName", "role", "schoolName", "mustChangePassword", "createdAt", "updatedAt"]
+    },
+    "Student": {
+      "title": "Student",
+      "description": "Registered student borrower record",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "internalStudentId": { "type": "string", "minLength": 2, "maxLength": 64 },
+        "schoolStudentNumber": { "type": "string", "maxLength": 64 },
+        "fullName": { "type": "string", "minLength": 2, "maxLength": 160 },
+        "className": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "registeredAt": { "type": "string", "minLength": 8, "maxLength": 32 },
+        "status": { "type": "string", "enum": ["active", "archived"] },
+        "notes": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "internalStudentId", "fullName", "className", "registeredAt", "status", "createdAt", "updatedAt"]
+    },
+    "BookTitle": {
+      "title": "BookTitle",
+      "description": "Normalized catalog title record linked to source inventory",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "author": { "type": "string", "maxLength": 200 },
+        "originalAuthorTitle": { "type": "string", "maxLength": 400 },
+        "inventoryNumberRaw": { "type": "string", "maxLength": 80 },
+        "publicationYearRaw": { "type": "string", "maxLength": 40 },
+        "publicationYear": { "type": "number" },
+        "departmentCode": { "type": "string", "maxLength": 40 },
+        "priceRaw": { "type": "string", "maxLength": 60 },
+        "reviewStatus": { "type": "string", "enum": ["confirmed", "needs_review", "archived"] },
+        "reviewIssues": { "type": "array" },
+        "sourceRecordId": { "type": "string", "maxLength": 128 },
+        "sourceRowNumber": { "type": "number" },
+        "isRangeRecord": { "type": "boolean" },
+        "rangeConfirmed": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "title", "reviewStatus", "isRangeRecord", "rangeConfirmed", "createdAt", "updatedAt"]
+    },
+    "PhysicalCopy": {
+      "title": "PhysicalCopy",
+      "description": "Confirmed physical book copy with unique internal ID",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "bookTitleId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "internalCopyCode": { "type": "string", "minLength": 2, "maxLength": 80 },
+        "originalInventoryNumber": { "type": "string", "maxLength": 80 },
+        "barcode": { "type": "string", "maxLength": 100 },
+        "status": { "type": "string", "enum": ["available", "issued", "damaged", "lost", "archived"] },
+        "confirmed": { "type": "boolean" },
+        "sourceRecordId": { "type": "string", "maxLength": 128 },
+        "activeLoanId": { "type": "string", "maxLength": 128 },
+        "notes": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "bookTitleId", "internalCopyCode", "status", "confirmed", "createdAt", "updatedAt"]
+    },
+    "ImportBatch": {
+      "title": "ImportBatch",
+      "description": "Idempotent workbook import batch record",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "fileName": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "sheetName": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "fileChecksum": { "type": "string", "minLength": 8, "maxLength": 128 },
+        "totalRowsScanned": { "type": "number" },
+        "bookRowsCount": { "type": "number" },
+        "confirmedCount": { "type": "number" },
+        "needsReviewCount": { "type": "number" },
+        "skippedCount": { "type": "number" },
+        "duplicateInventoryCount": { "type": "number" },
+        "errorCount": { "type": "number" },
+        "status": { "type": "string", "enum": ["completed", "failed"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "fileName", "sheetName", "fileChecksum", "totalRowsScanned", "bookRowsCount", "status", "createdAt"]
+    },
+    "SourceInventoryRecord": {
+      "title": "SourceInventoryRecord",
+      "description": "Immutable raw source row imported from Inventar.xlsx",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "importBatchId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "sourceFileName": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "sourceSheet": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "sourceRowNumber": { "type": "number" },
+        "rawColumns": { "type": "object" },
+        "normalizedValues": { "type": "object" },
+        "validationStatus": { "type": "string", "enum": ["confirmed", "needs_review", "skipped_subtotal", "skipped_date_only", "skipped_empty", "error"] },
+        "reviewNotes": { "type": "string", "maxLength": 600 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "importBatchId", "sourceFileName", "sourceSheet", "sourceRowNumber", "rawColumns", "validationStatus", "createdAt", "updatedAt"]
+    },
+    "Loan": {
+      "title": "Loan",
+      "description": "Active or completed student book loan",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "studentId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "bookTitleId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "physicalCopyId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "issuedDate": { "type": "string", "minLength": 10, "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        "dueDate": { "type": "string", "minLength": 10, "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        "returnedDate": { "type": "string", "maxLength": 10 },
+        "status": { "type": "string", "enum": ["active", "returned"] },
+        "returnCondition": { "type": "string", "enum": ["good", "damaged", "lost"] },
+        "notes": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "studentId", "bookTitleId", "physicalCopyId", "issuedDate", "dueDate", "status", "createdAt", "updatedAt"]
+    },
+    "LoanExtension": {
+      "title": "LoanExtension",
+      "description": "Audit record of a loan due date extension",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "loanId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "previousDueDate": { "type": "string", "minLength": 10, "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        "newDueDate": { "type": "string", "minLength": 10, "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        "reason": { "type": "string", "minLength": 2, "maxLength": 400 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "loanId", "previousDueDate", "newDueDate", "reason", "createdAt"]
+    },
+    "InventoryIncident": {
+      "title": "InventoryIncident",
+      "description": "Damaged or lost physical copy incident record",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "physicalCopyId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "loanId": { "type": "string", "maxLength": 128 },
+        "studentId": { "type": "string", "maxLength": 128 },
+        "incidentType": { "type": "string", "enum": ["damaged", "lost"] },
+        "notes": { "type": "string", "maxLength": 500 },
+        "resolved": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "physicalCopyId", "incidentType", "resolved", "createdAt", "updatedAt"]
+    },
+    "Notification": {
+      "title": "Notification",
+      "description": "In-app librarian notification",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "type": { "type": "string", "enum": ["due_today", "upcoming", "overdue", "incident", "import_error", "info"] },
+        "title": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "message": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "read": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "type", "title", "message", "read", "createdAt"]
+    },
+    "ActivityLog": {
+      "title": "ActivityLog",
+      "description": "Immutable operational audit trail entry",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "action": { "type": "string", "minLength": 2, "maxLength": 80 },
+        "entityType": { "type": "string", "minLength": 2, "maxLength": 60 },
+        "entityId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "actorName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "action", "entityType", "entityId", "summary", "actorName", "createdAt"]
+    },
+    "LibrarySettings": {
+      "title": "LibrarySettings",
+      "description": "School library configuration and borrowing policies",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "schoolName": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "librarianName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "defaultLoanDays": { "type": "number" },
+        "maxBooksPerStudent": { "type": "number" },
+        "timezone": { "type": "string", "minLength": 3, "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "schoolName", "librarianName", "defaultLoanDays", "maxBooksPerStudent", "timezone", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/librarian_profiles/{profileId}": {
+      "schema": { "$ref": "#/entities/LibrarianProfile" },
+      "description": "Librarian account profile documents"
+    },
+    "/students/{studentId}": {
+      "schema": { "$ref": "#/entities/Student" },
+      "description": "Student registry records"
+    },
+    "/book_titles/{bookId}": {
+      "schema": { "$ref": "#/entities/BookTitle" },
+      "description": "Normalized book catalog titles"
+    },
+    "/physical_copies/{copyId}": {
+      "schema": { "$ref": "#/entities/PhysicalCopy" },
+      "description": "Individual confirmed physical copies"
+    },
+    "/import_batches/{batchId}": {
+      "schema": { "$ref": "#/entities/ImportBatch" },
+      "description": "Workbook import batch logs"
+    },
+    "/source_inventory_records/{recordId}": {
+      "schema": { "$ref": "#/entities/SourceInventoryRecord" },
+      "description": "Preserved original Inventar.xlsx rows"
+    },
+    "/loans/{loanId}": {
+      "schema": { "$ref": "#/entities/Loan" },
+      "description": "Active and historical lending transactions"
+    },
+    "/loan_extensions/{extensionId}": {
+      "schema": { "$ref": "#/entities/LoanExtension" },
+      "description": "Deadline extension audit log"
+    },
+    "/inventory_incidents/{incidentId}": {
+      "schema": { "$ref": "#/entities/InventoryIncident" },
+      "description": "Damaged and lost copy incidents"
+    },
+    "/notifications/{notificationId}": {
+      "schema": { "$ref": "#/entities/Notification" },
+      "description": "Librarian in-app notifications"
+    },
+    "/activity_logs/{logId}": {
+      "schema": { "$ref": "#/entities/ActivityLog" },
+      "description": "Immutable library operation audit logs"
+    },
+    "/library_settings/{settingId}": {
+      "schema": { "$ref": "#/entities/LibrarySettings" },
+      "description": "School library settings documents"
+    }
+  }
+}

@@ -1,0 +1,474 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email == 'asilbeknuraliyev979@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isOwner(data) {
+      return isSignedIn() && data.ownerUid == request.auth.uid;
+    }
+
+    function isDateYmd(val) {
+      return val is string && val.size() == 10 && val.matches('^\\d{4}-\\d{2}-\\d{2}$');
+    }
+
+    function isValidLibrarianProfile(data) {
+      return data.keys().hasAll(['ownerUid', 'username', 'displayName', 'role', 'schoolName', 'mustChangePassword', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerUid', 'username', 'displayName', 'role', 'schoolName', 'mustChangePassword', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerUid)
+        && data.ownerUid == request.auth.uid
+        && data.username is string && data.username.size() >= 2 && data.username.size() <= 64
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
+        && data.role in ['librarian', 'admin']
+        && data.schoolName is string && data.schoolName.size() >= 1 && data.schoolName.size() <= 200
+        && data.mustChangePassword is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidStudent(data) {
+      return data.keys().hasAll(['ownerUid', 'internalStudentId', 'fullName', 'className', 'registeredAt', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerUid', 'internalStudentId', 'schoolStudentNumber', 'fullName', 'className', 'registeredAt', 'status', 'notes', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerUid)
+        && data.ownerUid == request.auth.uid
+        && data.internalStudentId is string && data.internalStudentId.size() >= 2 && data.internalStudentId.size() <= 64
+        && (!('schoolStudentNumber' in data) || (data.schoolStudentNumber is string && data.schoolStudentNumber.size() <= 64))
+        && data.fullName is string && data.fullName.size() >= 2 && data.fullName.size() <= 160
+        && data.className is string && data.className.size() >= 1 && data.className.size() <= 32
+        && data.registeredAt is string && data.registeredAt.size() >= 8 && data.registeredAt.size() <= 32
+        && data.status in ['active', 'archived']
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 500))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidBookTitle(data) {
+      return data.keys().hasAll(['ownerUid', 'title', 'reviewStatus', 'isRangeRecord', 'rangeConfirmed', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerUid', 'title', 'author', 'originalAuthorTitle', 'inventoryNumberRaw', 'publicationYearRaw', 'publicationYear', 'departmentCode', 'priceRaw', 'reviewStatus', 'reviewIssues', 'sourceRecordId', 'sourceRowNumber', 'isRangeRecord', 'rangeConfirmed', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerUid)
+        && data.ownerUid == request.auth.uid
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 300
+        && (!('author' in data) || (data.author is string && data.author.size() <= 200))
+        && (!('originalAuthorTitle' in data) || (data.originalAuthorTitle is string && data.originalAuthorTitle.size() <= 400))
+        && (!('inventoryNumberRaw' in data) || (data.inventoryNumberRaw is string && data.inventoryNumberRaw.size() <= 80))
+        && (!('publicationYearRaw' in data) || (data.publicationYearRaw is string && data.publicationYearRaw.size() <= 40))
+        && (!('publicationYear' in data) || data.publicationYear == null || (data.publicationYear is int && data.publicationYear >= 1800 && data.publicationYear <= 2100))
+        && (!('departmentCode' in data) || (data.departmentCode is string && data.departmentCode.size() <= 40))
+        && (!('priceRaw' in data) || (data.priceRaw is string && data.priceRaw.size() <= 60))
+        && data.reviewStatus in ['confirmed', 'needs_review', 'archived']
+        && (!('reviewIssues' in data) || (data.reviewIssues is list && data.reviewIssues.size() <= 10 && (data.reviewIssues.size() == 0 || data.reviewIssues[0] is string)))
+        && (!('sourceRecordId' in data) || (data.sourceRecordId is string && data.sourceRecordId.size() <= 128))
+        && (!('sourceRowNumber' in data) || data.sourceRowNumber == null || (data.sourceRowNumber is int && data.sourceRowNumber >= 1))
+        && data.isRangeRecord is bool
+        && data.rangeConfirmed is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidPhysicalCopy(data) {
+      return data.keys().hasAll(['ownerUid', 'bookTitleId', 'internalCopyCode', 'status', 'confirmed', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerUid', 'bookTitleId', 'internalCopyCode', 'originalInventoryNumber', 'barcode', 'status', 'confirmed', 'sourceRecordId', 'activeLoanId', 'notes', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerUid)
+        && data.ownerUid == request.auth.uid
+        && isValidId(data.bookTitleId)
+        && data.internalCopyCode is string && data.internalCopyCode.size() >= 2 && data.internalCopyCode.size() <= 80
+        && (!('originalInventoryNumber' in data) || (data.originalInventoryNumber is string && data.originalInventoryNumber.size() <= 80))
+        && (!('barcode' in data) || (data.barcode is string && data.barcode.size() <= 100))
+        && data.status in ['available', 'issued', 'damaged', 'lost', 'archived']
+        && data.confirmed is bool
+        && (!('sourceRecordId' in data) || (data.sourceRecordId is string && data.sourceRecordId.size() <= 128))
+        && (!('activeLoanId' in data) || data.activeLoanId == null || (data.activeLoanId is string && data.activeLoanId.size() <= 128))
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 500))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidImportBatch(data) {
+      return data.keys().hasAll(['ownerUid', 'fileName', 'sheetName', 'fileChecksum', 'totalRowsScanned', 'bookRowsCount', 'status', 'createdAt'])
+        && data.keys().hasOnly(['ownerUid', 'fileName', 'sheetName', 'fileChecksum', 'totalRowsScanned', 'bookRowsCount', 'confirmedCount', 'needsReviewCount', 'skippedCount', 'duplicateInventoryCount', 'errorCount', 'status', 'createdAt'])
+        && isValidId(data.ownerUid)
+        && data.ownerUid == request.auth.uid
+        && data.fileName is string && data.fileName.size() >= 1 && data.fileName.size() <= 200
+        && data.sheetName is string && data.sheetName.size() >= 1 && data.sheetName.size() <= 100
+        && data.fileChecksum is string && data.fileChecksum.size() >= 8 && data.fileChecksum.size() <= 128
+        && data.totalRowsScanned is int && data.totalRowsScanned >= 0
+        && data.bookRowsCount is int && data.bookRowsCount >= 0
+        && (!('confirmedCount' in data) || (data.confirmedCount is int && data.confirmedCount >= 0))
+        && (!('needsReviewCount' in data) || (data.needsReviewCount is int && data.needsReviewCount >= 0))
+        && (!('skippedCount' in data) || (data.skippedCount is int && data.skippedCount >= 0))
+        && (!('duplicateInventoryCount' in data) || (data.duplicateInventoryCount is int && data.duplicateInventoryCount >= 0))
+        && (!('errorCount' in data) || (data.errorCount is int && data.errorCount >= 0))
+        && data.status in ['completed', 'failed']
+        && data.createdAt is timestamp;
+    }
+
+    function isValidSourceInventoryRecord(data) {
+      return data.keys().hasAll(['ownerUid', 'importBatchId', 'sourceFileName', 'sourceSheet', 'sourceRowNumber', 'rawColumns', 'validationStatus', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerUid', 'importBatchId', 'sourceFileName', 'sourceSheet', 'sourceRowNumber', 'rawColumns', 'normalizedValues', 'validationStatus', 'reviewNotes', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerUid)
+        && data.ownerUid == request.auth.uid
+        && isValidId(data.importBatchId)
+        && data.sourceFileName is string && data.sourceFileName.size() >= 1 && data.sourceFileName.size() <= 200
+        && data.sourceSheet is string && data.sourceSheet.size() >= 1 && data.sourceSheet.size() <= 100
+        && data.sourceRowNumber is int && data.sourceRowNumber >= 1
+        && data.rawColumns is map
+        && (!('normalizedValues' in data) || data.normalizedValues is map)
+        && data.validationStatus in ['confirmed', 'needs_review', 'skipped_subtotal', 'skipped_date_only', 'skipped_empty', 'error']
+        && (!('reviewNotes' in data) || (data.reviewNotes is string && data.reviewNotes.size() <= 600))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidLoan(data) {
+      return data.keys().hasAll(['ownerUid', 'studentId', 'bookTitleId', 'physicalCopyId', 'issuedDate', 'dueDate', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerUid', 'studentId', 'bookTitleId', 'physicalCopyId', 'issuedDate', 'dueDate', 'returnedDate', 'status', 'returnCondition', 'notes', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerUid)
+        && data.ownerUid == request.auth.uid
+        && isValidId(data.studentId)
+        && isValidId(data.bookTitleId)
+        && isValidId(data.physicalCopyId)
+        && isDateYmd(data.issuedDate)
+        && isDateYmd(data.dueDate)
+        && (!('returnedDate' in data) || data.returnedDate == null || isDateYmd(data.returnedDate))
+        && data.status in ['active', 'returned']
+        && (!('returnCondition' in data) || data.returnCondition == null || data.returnCondition in ['good', 'damaged', 'lost'])
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 500))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidLoanExtension(data) {
+      return data.keys().hasAll(['ownerUid', 'loanId', 'previousDueDate', 'newDueDate', 'reason', 'createdAt'])
+        && data.keys().hasOnly(['ownerUid', 'loanId', 'previousDueDate', 'newDueDate', 'reason', 'createdAt'])
+        && isValidId(data.ownerUid)
+        && data.ownerUid == request.auth.uid
+        && isValidId(data.loanId)
+        && isDateYmd(data.previousDueDate)
+        && isDateYmd(data.newDueDate)
+        && data.reason is string && data.reason.size() >= 2 && data.reason.size() <= 400
+        && data.createdAt is timestamp;
+    }
+
+    function isValidInventoryIncident(data) {
+      return data.keys().hasAll(['ownerUid', 'physicalCopyId', 'incidentType', 'resolved', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerUid', 'physicalCopyId', 'loanId', 'studentId', 'incidentType', 'notes', 'resolved', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerUid)
+        && data.ownerUid == request.auth.uid
+        && isValidId(data.physicalCopyId)
+        && (!('loanId' in data) || data.loanId == null || isValidId(data.loanId))
+        && (!('studentId' in data) || data.studentId == null || isValidId(data.studentId))
+        && data.incidentType in ['damaged', 'lost']
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 500))
+        && data.resolved is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidNotification(data) {
+      return data.keys().hasAll(['ownerUid', 'type', 'title', 'message', 'read', 'createdAt'])
+        && data.keys().hasOnly(['ownerUid', 'type', 'title', 'message', 'read', 'createdAt'])
+        && isValidId(data.ownerUid)
+        && data.ownerUid == request.auth.uid
+        && data.type in ['due_today', 'upcoming', 'overdue', 'incident', 'import_error', 'info']
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 160
+        && data.message is string && data.message.size() >= 1 && data.message.size() <= 500
+        && data.read is bool
+        && data.createdAt is timestamp;
+    }
+
+    function isValidActivityLog(data) {
+      return data.keys().hasAll(['ownerUid', 'action', 'entityType', 'entityId', 'summary', 'actorName', 'createdAt'])
+        && data.keys().hasOnly(['ownerUid', 'action', 'entityType', 'entityId', 'summary', 'actorName', 'createdAt'])
+        && isValidId(data.ownerUid)
+        && data.ownerUid == request.auth.uid
+        && data.action is string && data.action.size() >= 2 && data.action.size() <= 80
+        && data.entityType is string && data.entityType.size() >= 2 && data.entityType.size() <= 60
+        && data.entityId is string && data.entityId.size() >= 1 && data.entityId.size() <= 128
+        && data.summary is string && data.summary.size() >= 1 && data.summary.size() <= 500
+        && data.actorName is string && data.actorName.size() >= 1 && data.actorName.size() <= 120
+        && data.createdAt is timestamp;
+    }
+
+    function isValidLibrarySettings(data) {
+      return data.keys().hasAll(['ownerUid', 'schoolName', 'librarianName', 'defaultLoanDays', 'maxBooksPerStudent', 'timezone', 'updatedAt'])
+        && data.keys().hasOnly(['ownerUid', 'schoolName', 'librarianName', 'defaultLoanDays', 'maxBooksPerStudent', 'timezone', 'updatedAt'])
+        && isValidId(data.ownerUid)
+        && data.ownerUid == request.auth.uid
+        && data.schoolName is string && data.schoolName.size() >= 1 && data.schoolName.size() <= 200
+        && data.librarianName is string && data.librarianName.size() >= 1 && data.librarianName.size() <= 120
+        && data.defaultLoanDays is int && data.defaultLoanDays >= 1 && data.defaultLoanDays <= 365
+        && data.maxBooksPerStudent is int && data.maxBooksPerStudent >= 1 && data.maxBooksPerStudent <= 50
+        && data.timezone is string && data.timezone.size() >= 3 && data.timezone.size() <= 64
+        && data.updatedAt is timestamp;
+    }
+
+    match /admins/{adminUid} {
+      allow get: if isSignedIn() && isValidId(adminUid) && request.auth.uid == adminUid;
+      allow list, write: if false;
+    }
+
+    match /librarian_profiles/{profileId} {
+      allow get: if isSignedIn() && isValidId(profileId) && (isOwner(existing()) || isAdmin());
+      allow list: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isSignedIn()
+        && isValidId(profileId)
+        && profileId == request.auth.uid
+        && isValidLibrarianProfile(incoming())
+        && incoming().role == 'librarian'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isSignedIn()
+        && isValidId(profileId)
+        && isValidLibrarianProfile(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          (isOwner(existing()) && incoming().role == existing().role && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'schoolName', 'mustChangePassword', 'updatedAt']))
+        );
+      allow delete: if false;
+    }
+
+    match /students/{studentId} {
+      allow get: if isSignedIn() && isValidId(studentId) && (isOwner(existing()) || isAdmin());
+      allow list: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isSignedIn()
+        && isValidId(studentId)
+        && isValidStudent(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isSignedIn()
+        && isValidId(studentId)
+        && isValidStudent(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          (isOwner(existing()) && incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'className', 'schoolStudentNumber', 'status', 'notes', 'updatedAt']))
+        );
+      allow delete: if isAdmin() && isValidId(studentId);
+    }
+
+    match /book_titles/{bookId} {
+      allow get: if isSignedIn() && isValidId(bookId) && (isOwner(existing()) || isAdmin());
+      allow list: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isSignedIn()
+        && isValidId(bookId)
+        && isValidBookTitle(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isSignedIn()
+        && isValidId(bookId)
+        && isValidBookTitle(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          (isOwner(existing()) && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'author', 'publicationYear', 'departmentCode', 'reviewStatus', 'reviewIssues', 'rangeConfirmed', 'updatedAt']))
+        );
+      allow delete: if isAdmin() && isValidId(bookId);
+    }
+
+    match /physical_copies/{copyId} {
+      allow get: if isSignedIn() && isValidId(copyId) && (isOwner(existing()) || isAdmin());
+      allow list: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isSignedIn()
+        && isValidId(copyId)
+        && isValidPhysicalCopy(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && get(/databases/$(database)/documents/book_titles/$(incoming().bookTitleId)).data.ownerUid == request.auth.uid;
+      allow update: if isSignedIn()
+        && isValidId(copyId)
+        && isValidPhysicalCopy(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().bookTitleId == existing().bookTitleId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          (isOwner(existing()) && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'confirmed', 'activeLoanId', 'barcode', 'notes', 'updatedAt']))
+        );
+      allow delete: if isAdmin() && isValidId(copyId);
+    }
+
+    match /import_batches/{batchId} {
+      allow get: if isSignedIn() && isValidId(batchId) && (isOwner(existing()) || isAdmin());
+      allow list: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isSignedIn()
+        && isValidId(batchId)
+        && isValidImportBatch(incoming())
+        && incoming().createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    match /source_inventory_records/{recordId} {
+      allow get: if isSignedIn() && isValidId(recordId) && (isOwner(existing()) || isAdmin());
+      allow list: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isSignedIn()
+        && isValidId(recordId)
+        && isValidSourceInventoryRecord(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && get(/databases/$(database)/documents/import_batches/$(incoming().importBatchId)).data.ownerUid == request.auth.uid;
+      allow update: if isSignedIn()
+        && isValidId(recordId)
+        && isValidSourceInventoryRecord(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().importBatchId == existing().importBatchId
+        && incoming().sourceFileName == existing().sourceFileName
+        && incoming().sourceSheet == existing().sourceSheet
+        && incoming().sourceRowNumber == existing().sourceRowNumber
+        && incoming().rawColumns == existing().rawColumns
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          (isOwner(existing()) && incoming().diff(existing()).affectedKeys().hasOnly(['normalizedValues', 'validationStatus', 'reviewNotes', 'updatedAt']))
+        );
+      allow delete: if false;
+    }
+
+    match /loans/{loanId} {
+      allow get: if isSignedIn() && isValidId(loanId) && (isOwner(existing()) || isAdmin());
+      allow list: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isSignedIn()
+        && isValidId(loanId)
+        && isValidLoan(incoming())
+        && incoming().status == 'active'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && get(/databases/$(database)/documents/students/$(incoming().studentId)).data.ownerUid == request.auth.uid
+        && get(/databases/$(database)/documents/book_titles/$(incoming().bookTitleId)).data.ownerUid == request.auth.uid
+        && get(/databases/$(database)/documents/physical_copies/$(incoming().physicalCopyId)).data.ownerUid == request.auth.uid;
+      allow update: if isSignedIn()
+        && isValidId(loanId)
+        && isValidLoan(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().studentId == existing().studentId
+        && incoming().bookTitleId == existing().bookTitleId
+        && incoming().physicalCopyId == existing().physicalCopyId
+        && incoming().issuedDate == existing().issuedDate
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          (isOwner(existing()) && existing().status == 'active' && (
+            (incoming().status == 'active' && incoming().diff(existing()).affectedKeys().hasOnly(['dueDate', 'notes', 'updatedAt'])) ||
+            (incoming().status == 'returned' && incoming().returnedDate != null && incoming().returnCondition != null && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'returnedDate', 'returnCondition', 'notes', 'updatedAt']))
+          ))
+        );
+      allow delete: if false;
+    }
+
+    match /loan_extensions/{extensionId} {
+      allow get: if isSignedIn() && isValidId(extensionId) && (isOwner(existing()) || isAdmin());
+      allow list: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isSignedIn()
+        && isValidId(extensionId)
+        && isValidLoanExtension(incoming())
+        && incoming().createdAt == request.time
+        && get(/databases/$(database)/documents/loans/$(incoming().loanId)).data.ownerUid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    match /inventory_incidents/{incidentId} {
+      allow get: if isSignedIn() && isValidId(incidentId) && (isOwner(existing()) || isAdmin());
+      allow list: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isSignedIn()
+        && isValidId(incidentId)
+        && isValidInventoryIncident(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && get(/databases/$(database)/documents/physical_copies/$(incoming().physicalCopyId)).data.ownerUid == request.auth.uid;
+      allow update: if isSignedIn()
+        && isValidId(incidentId)
+        && isValidInventoryIncident(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().physicalCopyId == existing().physicalCopyId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          (isOwner(existing()) && incoming().diff(existing()).affectedKeys().hasOnly(['resolved', 'notes', 'updatedAt']))
+        );
+      allow delete: if false;
+    }
+
+    match /notifications/{notificationId} {
+      allow get: if isSignedIn() && isValidId(notificationId) && (isOwner(existing()) || isAdmin());
+      allow list: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isSignedIn()
+        && isValidId(notificationId)
+        && isValidNotification(incoming())
+        && incoming().createdAt == request.time;
+      allow update: if isSignedIn()
+        && isValidId(notificationId)
+        && isValidNotification(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && (
+          isAdmin() ||
+          (isOwner(existing()) && incoming().diff(existing()).affectedKeys().hasOnly(['read']))
+        );
+      allow delete: if isSignedIn() && isValidId(notificationId) && (isOwner(existing()) || isAdmin());
+    }
+
+    match /activity_logs/{logId} {
+      allow get: if isSignedIn() && isValidId(logId) && (isOwner(existing()) || isAdmin());
+      allow list: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isSignedIn()
+        && isValidId(logId)
+        && isValidActivityLog(incoming())
+        && incoming().createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    match /library_settings/{settingId} {
+      allow get: if isSignedIn() && isValidId(settingId) && (isOwner(existing()) || isAdmin());
+      allow list: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isSignedIn()
+        && isValidId(settingId)
+        && settingId == request.auth.uid
+        && isValidLibrarySettings(incoming())
+        && incoming().updatedAt == request.time;
+      allow update: if isSignedIn()
+        && isValidId(settingId)
+        && isValidLibrarySettings(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          (isOwner(existing()) && incoming().diff(existing()).affectedKeys().hasOnly(['schoolName', 'librarianName', 'defaultLoanDays', 'maxBooksPerStudent', 'timezone', 'updatedAt']))
+        );
+      allow delete: if false;
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "School Library — Kattaqo‘rg‘on tuman ixtisoslashtirilgan maktabi",
+  "description": "Kattaqo‘rg‘on tuman ixtisoslashtirilgan maktabi uchun kutubxona inventari, o‘quvchilar, kitob berish-qaytarish, qaytarish muddatlari va Excel hisobotlarini boshqarish tizimi.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
