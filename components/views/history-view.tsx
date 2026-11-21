@@ -1,15 +1,19 @@
 'use client';
 
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Download, Search } from 'lucide-react';
 import { useLibrary } from '@/components/library-context';
 import { Button, Input, PanelCard, SelectField } from '@/components/ui/primitives';
 import { formatDateTimeTashkent } from '@/lib/date-utils';
 
 export function HistoryView() {
-  const { data, downloadTableXlsx } = useLibrary();
+  const { data, ensureFullData, downloadTableXlsx } = useLibrary();
   const [query, setQuery] = useState('');
   const [entityFilter, setEntityFilter] = useState('all');
+
+  useEffect(() => {
+    void ensureFullData();
+  }, [ensureFullData]);
 
   const logs = useMemo(() => {
     const q = query.trim().toLowerCase();

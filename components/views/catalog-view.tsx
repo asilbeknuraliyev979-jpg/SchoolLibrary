@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useDeferredValue, useMemo, useRef, useState } from 'react';
 import {
   ChevronLeft,
   ChevronRight,
@@ -24,16 +24,22 @@ import {
   StatusText,
 } from '@/components/ui/primitives';
 import { authFetch } from '@/lib/api-client';
+import {
+  patchBookCreated,
+  patchBookUpdated,
+  patchCopiesAdded,
+} from '@/lib/client-state-patch';
 import { getTodayTashkent } from '@/lib/date-utils';
 import type { BookTitle } from '@/lib/types';
 
 const PAGE_SIZE = 50;
 
 export function CatalogView() {
-  const { data, refreshData, downloadTableXlsx } = useLibrary();
+  const { data, indexes, mutateData, refreshData, downloadTableXlsx } = useLibrary();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const [search, setSearch] = useState('');
+  const deferredSearch = useDeferredValue(search);
   const [statusFilter, setStatusFilter] = useState<'all' | 'available' | 'issued' | 'needs_review'>('all');
   const [page, setPage] = useState(1);
   const [busy, setBusy] = useState(false);
@@ -54,22 +60,10 @@ export function CatalogView() {
   const [editInv, setEditInv] = useState('');
   const [addCopyCount, setAddCopyCount] = useState('1');
 
-  const copiesByBook = useMemo(() => {
-    const map = new Map<string, { total: number; available: number; issued: number }>();
-    for (const c of data?.physicalCopies ?? []) {
-      const entry = map.get(c.bookTitleId) ?? { total: 0, available: 0, issued: 0 };
-      if (c.confirmed && c.status !== 'archived') {
-        entry.total += 1;
-        if (c.status === 'available') entry.available += 1;
-        if (c.status === 'issued') entry.issued += 1;
-      }
-      map.set(c.bookTitleId, entry);
-    }
-    return map;
-  }, [data?.physicalCopies]);
+  const { bookMap, copiesByBook, bookSearchText } = indexes;
 
   const filteredBooks = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = deferredSearch.trim().toLowerCase();
     return (data?.bookTitles ?? []).filter((book) => {
       if (book.reviewStatus === 'archived') return false;
       const counts = copiesByBook.get(book.id) ?? { total: 0, available: 0, issued: 0 };
@@ -77,23 +71,15 @@ export function CatalogView() {
       if (statusFilter === 'issued' && counts.issued === 0) return false;
       if (statusFilter === 'needs_review' && book.reviewStatus !== 'needs_review') return false;
       if (!q) return true;
-      return (
-        book.title.toLowerCase().includes(q) ||
-        book.author.toLowerCase().includes(q) ||
-        book.inventoryNumberRaw.toLowerCase().includes(q) ||
-        book.originalAuthorTitle.toLowerCase().includes(q)
-      );
+      return (bookSearchText.get(book.id) ?? '').includes(q);
     });
-  }, [copiesByBook, data?.bookTitles, search, statusFilter]);
+  }, [bookSearchText, copiesByBook, data?.bookTitles, deferredSearch, statusFilter]);
 
   const totalPages = Math.max(1, Math.ceil(filteredBooks.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
   const pageItems = filteredBooks.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
-  const selectedBook = useMemo(
-    () => (data?.bookTitles ?? []).find((b) => b.id === selectedBookId) ?? null,
-    [data?.bookTitles, selectedBookId]
-  );
+  const selectedBook = selectedBookId ? bookMap.get(selectedBookId) ?? null : null;
 
   if (!data) {
     return <p className="text-xs text-[#64748B]">Ma’lumotlar yuklanmoqda...</p>;
@@ -184,6 +170,9 @@ export function CatalogView() {
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || 'Kitob qo‘shishda xatolik.');
+      if (json.book) {
+        mutateData((prev) => patchBookCreated(prev, json.book, json.copies ?? []));
+      }
       toast.success('Kitob muvaffaqiyatli qo‘shildi.');
       setAddOpen(false);
       setNewTitle('');
@@ -191,7 +180,6 @@ export function CatalogView() {
       setNewInv('');
       setNewYear('');
       setNewCopies('1');
-      await refreshData();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Xatolik yuz berdi.');
     } finally {
@@ -218,8 +206,10 @@ export function CatalogView() {
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || 'Saqlashda xatolik.');
+      if (json.book) {
+        mutateData((prev) => patchBookUpdated(prev, json.book));
+      }
       toast.success('Kitob ma’lumotlari saqlandi.');
-      await refreshData();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Xatolik yuz berdi.');
     } finally {
@@ -243,8 +233,10 @@ export function CatalogView() {
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || 'Nusxa qo‘shishda xatolik.');
+      if (json.book) {
+        mutateData((prev) => patchCopiesAdded(prev, json.book, json.createdCopies ?? []));
+      }
       toast.success(`${count} ta nusxa tasdiqlandi.`);
-      await refreshData();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Xatolik yuz berdi.');
     } finally {

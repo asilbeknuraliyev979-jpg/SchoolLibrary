@@ -1,50 +1,26 @@
 'use client';
 
-import React, { useMemo, useState } from 'react';
-import { Check, Download, Search } from 'lucide-react';
-import { toast } from 'sonner';
+import React, { useDeferredValue, useMemo, useState } from 'react';
+import { Check, ChevronLeft, ChevronRight, Download, Search } from 'lucide-react';
 import { useLibrary } from '@/components/library-context';
 import { Button, Input, PanelCard, SelectField, StatusText } from '@/components/ui/primitives';
-import { authFetch } from '@/lib/api-client';
 import { resolveLoanBorrower } from '@/lib/borrower-utils';
 import { classifyLoanDeadline, formatYmdDisplay, getTodayTashkent } from '@/lib/date-utils';
-import { compareClassNames } from '@/lib/utils';
 
 type TabFilter = 'all' | 'active' | 'overdue' | 'returned';
+const PAGE_SIZE = 50;
 
 export function DeadlinesView() {
-  const { data, refreshData, downloadTableXlsx } = useLibrary();
+  const { data, indexes, returnLoanOptimistic, downloadTableXlsx } = useLibrary();
   const [tab, setTab] = useState<TabFilter>('all');
   const [search, setSearch] = useState('');
+  const deferredSearch = useDeferredValue(search);
   const [classFilter, setClassFilter] = useState('');
+  const [page, setPage] = useState(1);
   const [busyLoanId, setBusyLoanId] = useState<string | null>(null);
 
   const today = data?.dashboard.today ?? getTodayTashkent();
-
-  const studentMap = useMemo(
-    () => new Map((data?.students ?? []).map((s) => [s.id, s])),
-    [data?.students]
-  );
-  const teacherMap = useMemo(
-    () => new Map((data?.teachers ?? []).map((t) => [t.id, t])),
-    [data?.teachers]
-  );
-  const bookMap = useMemo(
-    () => new Map((data?.bookTitles ?? []).map((b) => [b.id, b])),
-    [data?.bookTitles]
-  );
-  const copyMap = useMemo(
-    () => new Map((data?.physicalCopies ?? []).map((c) => [c.id, c])),
-    [data?.physicalCopies]
-  );
-
-  const classes = useMemo(() => {
-    const set = new Set<string>();
-    for (const s of data?.students ?? []) {
-      if (s.status === 'active' && s.className) set.add(s.className);
-    }
-    return Array.from(set).sort(compareClassNames);
-  }, [data?.students]);
+  const { studentMap, teacherMap, bookMap, copyMap, activeClasses } = indexes;
 
   const enrichedLoans = useMemo(() => {
     return (data?.loans ?? []).map((loan) => {
@@ -52,7 +28,18 @@ export function DeadlinesView() {
       const book = bookMap.get(loan.bookTitleId);
       const copy = copyMap.get(loan.physicalCopyId);
       const dl = classifyLoanDeadline(loan, today);
-      return { loan, borrower, book, copy, dl };
+      const searchText = [
+        borrower.fullName,
+        borrower.groupLabel,
+        borrower.typeLabel,
+        book?.title,
+        book?.author,
+        copy?.originalInventoryNumber,
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase();
+      return { loan, borrower, book, copy, dl, searchText };
     });
   }, [bookMap, copyMap, data?.loans, studentMap, teacherMap, today]);
 
@@ -72,35 +59,32 @@ export function DeadlinesView() {
   }, [enrichedLoans]);
 
   const filteredRows = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = deferredSearch.trim().toLowerCase();
     return enrichedLoans
-      .filter(({ loan, borrower, book, copy, dl }) => {
+      .filter(({ loan, borrower, dl, searchText }) => {
         if (tab === 'active' && loan.status !== 'active') return false;
         if (tab === 'overdue' && dl.bucket !== 'overdue') return false;
         if (tab === 'returned' && loan.status !== 'returned') return false;
         if (classFilter === '__teachers__' && borrower.type !== 'teacher') return false;
-        if (classFilter && classFilter !== '__teachers__' && (borrower.type !== 'student' || borrower.groupLabel !== classFilter)) {
+        if (
+          classFilter &&
+          classFilter !== '__teachers__' &&
+          (borrower.type !== 'student' || borrower.groupLabel !== classFilter)
+        ) {
           return false;
         }
         if (!q) return true;
-        const hay = [
-          borrower.fullName,
-          borrower.groupLabel,
-          borrower.typeLabel,
-          book?.title,
-          book?.author,
-          copy?.originalInventoryNumber,
-        ]
-          .filter(Boolean)
-          .join(' ')
-          .toLowerCase();
-        return hay.includes(q);
+        return searchText.includes(q);
       })
       .sort((a, b) => {
         if (a.loan.status !== b.loan.status) return a.loan.status === 'active' ? -1 : 1;
         return a.loan.dueDate.localeCompare(b.loan.dueDate);
       });
-  }, [classFilter, enrichedLoans, search, tab]);
+  }, [classFilter, deferredSearch, enrichedLoans, tab]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredRows.length / PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const pageRows = filteredRows.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
   if (!data) {
     return <p className="text-xs text-[#64748B]">Ma’lumotlar yuklanmoqda...</p>;
@@ -109,17 +93,7 @@ export function DeadlinesView() {
   async function handleQuickReturn(loanId: string) {
     setBusyLoanId(loanId);
     try {
-      const res = await authFetch('/api/loans', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'return', loanId, condition: 'good' }),
-      });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || 'Qaytarishda xatolik.');
-      toast.success('Kitob qaytarildi.');
-      await refreshData();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Xatolik yuz berdi.');
+      await returnLoanOptimistic(loanId);
     } finally {
       setBusyLoanId(null);
     }
@@ -179,7 +153,10 @@ export function DeadlinesView() {
               <button
                 key={t.id}
                 type="button"
-                onClick={() => setTab(t.id)}
+                onClick={() => {
+                  setTab(t.id);
+                  setPage(1);
+                }}
                 className={`px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition-colors cursor-pointer ${
                   active
                     ? 'bg-[#1E3A5F] text-white'
@@ -200,7 +177,10 @@ export function DeadlinesView() {
             <Search className="w-3.5 h-3.5 text-[#94A3B8] absolute left-3 top-1/2 -translate-y-1/2" />
             <Input
               value={search}
-              onChange={(e) => setSearch(e.target.value)}
+              onChange={(e) => {
+                setSearch(e.target.value);
+                setPage(1);
+              }}
               placeholder="O‘quvchi, o‘qituvchi, kitob..."
               aria-label="Monitoring qidiruvi"
               className="pl-8"
@@ -209,12 +189,15 @@ export function DeadlinesView() {
           <SelectField
             aria-label="Sinf yoki guruh bo‘yicha filtr"
             value={classFilter}
-            onChange={(e) => setClassFilter(e.target.value)}
+            onChange={(e) => {
+              setClassFilter(e.target.value);
+              setPage(1);
+            }}
             className="w-full sm:w-40"
           >
             <option value="">Barchasi</option>
             <option value="__teachers__">O‘qituvchilar</option>
-            {classes.map((c) => (
+            {activeClasses.map((c) => (
               <option key={c} value={c}>
                 {c}
               </option>
@@ -243,14 +226,14 @@ export function DeadlinesView() {
               </tr>
             </thead>
             <tbody className="divide-y divide-[#E2E8F0] text-sm">
-              {filteredRows.length === 0 ? (
+              {pageRows.length === 0 ? (
                 <tr>
                   <td colSpan={7} className="py-10 px-4 text-center text-xs text-[#64748B]">
                     Ma’lumot topilmadi.
                   </td>
                 </tr>
               ) : (
-                filteredRows.map(({ loan, borrower, book, dl }) => {
+                pageRows.map(({ loan, borrower, book, dl }) => {
                   const isOverdue = loan.status === 'active' && dl.bucket === 'overdue';
                   return (
                     <tr
@@ -317,8 +300,33 @@ export function DeadlinesView() {
           </table>
         </div>
 
-        <div className="px-4 py-3 border-t border-[#E2E8F0] text-xs text-[#64748B] tabular-nums">
-          Jami: <strong className="text-[#0F172A]">{filteredRows.length}</strong> ta yozuv
+        <div className="px-4 py-3 border-t border-[#E2E8F0] flex items-center justify-between gap-3 text-xs text-[#64748B]">
+          <span className="tabular-nums">
+            Jami: <strong className="text-[#0F172A]">{filteredRows.length}</strong> ta yozuv
+          </span>
+          {totalPages > 1 && (
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={safePage <= 1}
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+              >
+                <ChevronLeft className="w-3.5 h-3.5" />
+              </Button>
+              <span className="tabular-nums">
+                {safePage} / {totalPages}
+              </span>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={safePage >= totalPages}
+                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              >
+                <ChevronRight className="w-3.5 h-3.5" />
+              </Button>
+            </div>
+          )}
         </div>
       </PanelCard>
     </div>

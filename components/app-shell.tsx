@@ -1,8 +1,6 @@
 'use client';
 
 import React, { useState } from 'react';
-import Link from 'next/link';
-import { usePathname } from 'next/navigation';
 import {
   BookMarked,
   BookOpen,
@@ -20,6 +18,13 @@ import {
 import { useLibrary } from '@/components/library-context';
 import { LoginScreen } from '@/components/login-screen';
 import { Button } from '@/components/ui/primitives';
+import { CatalogView } from '@/components/views/catalog-view';
+import { DashboardView } from '@/components/views/dashboard-view';
+import { DeadlinesView } from '@/components/views/deadlines-view';
+import { IssueView } from '@/components/views/issue-view';
+import { ReturnsView } from '@/components/views/returns-view';
+import { StudentsView } from '@/components/views/students-view';
+import { TeachersView } from '@/components/views/teachers-view';
 import { cn } from '@/lib/utils';
 
 const NAV_ITEMS = [
@@ -32,12 +37,33 @@ const NAV_ITEMS = [
   { href: '/deadlines', label: 'Monitoring', icon: CalendarClock },
 ] as const;
 
-export function AppShell({ children }: { children: React.ReactNode }) {
-  const { authLoading, user, logout, downloadFullXlsx } = useLibrary();
-  const pathname = usePathname();
-  const [mobileOpen, setMobileOpen] = useState(false);
+function renderCoreView(path: string): React.ReactNode | null {
+  switch (path) {
+    case '/':
+      return <DashboardView />;
+    case '/catalog':
+      return <CatalogView />;
+    case '/students':
+      return <StudentsView />;
+    case '/teachers':
+      return <TeachersView />;
+    case '/issue':
+      return <IssueView />;
+    case '/returns':
+      return <ReturnsView />;
+    case '/deadlines':
+      return <DeadlinesView />;
+    default:
+      return null;
+  }
+}
 
-  const activeNav = NAV_ITEMS.find((item) => item.href === pathname) ?? NAV_ITEMS[0];
+export function AppShell({ children }: { children: React.ReactNode }) {
+  const { authLoading, user, logout, downloadFullXlsx, activePath, navigate } = useLibrary();
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const [exporting, setExporting] = useState(false);
+
+  const activeNav = NAV_ITEMS.find((item) => item.href === activePath) ?? NAV_ITEMS[0];
 
   if (authLoading) {
     return (
@@ -51,13 +77,28 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     return <LoginScreen />;
   }
 
+  const handleNavClick = (href: string) => {
+    setMobileOpen(false);
+    navigate(href);
+  };
+
+  const handleDownloadFull = async () => {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      await downloadFullXlsx();
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const sidebarContent = (isMobile: boolean) => (
     <div className="flex flex-col h-full bg-white border-r border-[#E2E8F0]">
       <div className="h-14 flex items-center justify-between border-b border-[#E2E8F0] px-4 shrink-0">
-        <Link
-          href="/"
-          onClick={() => setMobileOpen(false)}
-          className="flex items-center gap-2.5 min-w-0"
+        <button
+          type="button"
+          onClick={() => handleNavClick('/')}
+          className="flex items-center gap-2.5 min-w-0 text-left cursor-pointer"
         >
           <div className="w-8 h-8 rounded-lg bg-[#1E3A5F] text-white flex items-center justify-center shrink-0">
             <BookOpen className="w-4 h-4" />
@@ -65,7 +106,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           <span className="text-sm font-semibold tracking-tight text-[#0F172A] truncate">
             SCHOOL LIBRARY
           </span>
-        </Link>
+        </button>
         {isMobile && (
           <button
             type="button"
@@ -81,14 +122,15 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <nav aria-label="Asosiy menyu" className="flex-1 py-3 px-2.5 space-y-0.5">
         {NAV_ITEMS.map((item) => {
           const Icon = item.icon;
-          const isActive = pathname === item.href;
+          const isActive = activePath === item.href;
           return (
-            <Link
+            <button
               key={item.href}
-              href={item.href}
-              onClick={() => setMobileOpen(false)}
+              type="button"
+              aria-current={isActive ? 'page' : undefined}
+              onClick={() => handleNavClick(item.href)}
               className={cn(
-                'flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm font-medium whitespace-nowrap transition-colors',
+                'w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm font-medium whitespace-nowrap transition-colors cursor-pointer text-left',
                 isActive
                   ? 'bg-[#1E3A5F] text-white'
                   : 'text-[#334155] hover:bg-[#F1F5F9] hover:text-[#0F172A]'
@@ -96,7 +138,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             >
               <Icon className={cn('w-4 h-4 shrink-0', isActive ? 'text-white' : 'text-[#64748B]')} />
               <span>{item.label}</span>
-            </Link>
+            </button>
           );
         })}
       </nav>
@@ -118,6 +160,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       </div>
     </div>
   );
+
+  const coreView = renderCoreView(activePath);
 
   return (
     <div className="min-h-screen bg-white flex">
@@ -150,15 +194,24 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
-            <Button variant="outline" size="sm" onClick={() => void downloadFullXlsx()}>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={exporting}
+              onClick={() => void handleDownloadFull()}
+            >
               <Download className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Umumiy hisobot (XLSX)</span>
+              <span className="hidden sm:inline">
+                {exporting ? 'Tayyorlanmoqda...' : 'Umumiy hisobot (XLSX)'}
+              </span>
               <span className="sm:hidden">XLSX</span>
             </Button>
           </div>
         </header>
 
-        <main className="flex-1 p-4 lg:p-6 max-w-[1320px] w-full mx-auto">{children}</main>
+        <main className="flex-1 p-4 lg:p-6 max-w-[1320px] w-full mx-auto">
+          {coreView ?? children}
+        </main>
       </div>
     </div>
   );

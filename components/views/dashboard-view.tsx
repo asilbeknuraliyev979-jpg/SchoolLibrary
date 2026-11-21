@@ -1,7 +1,6 @@
 'use client';
 
-import React, { useMemo, useState } from 'react';
-import Link from 'next/link';
+import React, { useDeferredValue, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   BookCheck,
@@ -21,32 +20,25 @@ import { Button, Input, PanelCard, SelectField, StatusText } from '@/components/
 import { authFetch } from '@/lib/api-client';
 import { resolveLoanBorrower } from '@/lib/borrower-utils';
 import { classifyLoanDeadline, formatYmdDisplay, getTodayTashkent } from '@/lib/date-utils';
-import { compareClassNames } from '@/lib/utils';
 
 export function DashboardView() {
-  const { data, refreshData, downloadFullXlsx, downloadTableXlsx } = useLibrary();
+  const {
+    data,
+    indexes,
+    navigate,
+    returnLoanOptimistic,
+    refreshData,
+    downloadFullXlsx,
+    downloadTableXlsx,
+  } = useLibrary();
   const [search, setSearch] = useState('');
+  const deferredSearch = useDeferredValue(search);
   const [classFilter, setClassFilter] = useState('');
   const [busyAction, setBusyAction] = useState<string | null>(null);
 
   const today = data?.dashboard.today ?? getTodayTashkent();
-
-  const studentMap = useMemo(
-    () => new Map((data?.students ?? []).map((s) => [s.id, s])),
-    [data?.students]
-  );
-  const teacherMap = useMemo(
-    () => new Map((data?.teachers ?? []).map((t) => [t.id, t])),
-    [data?.teachers]
-  );
-  const bookMap = useMemo(
-    () => new Map((data?.bookTitles ?? []).map((b) => [b.id, b])),
-    [data?.bookTitles]
-  );
-  const copyMap = useMemo(
-    () => new Map((data?.physicalCopies ?? []).map((c) => [c.id, c])),
-    [data?.physicalCopies]
-  );
+  const { studentMap, teacherMap, bookMap, copyMap, activeClasses, sortedActiveStudents, sortedActiveTeachers } =
+    indexes;
 
   const activeLoans = useMemo(
     () => (data?.loans ?? []).filter((l) => l.status === 'active'),
@@ -61,16 +53,8 @@ export function DashboardView() {
     [activeLoans, today]
   );
 
-  const classes = useMemo(() => {
-    const set = new Set<string>();
-    for (const s of data?.students ?? []) {
-      if (s.status === 'active' && s.className) set.add(s.className);
-    }
-    return Array.from(set).sort(compareClassNames);
-  }, [data?.students]);
-
   const tableRows = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = deferredSearch.trim().toLowerCase();
     return activeLoans
       .map((loan) => {
         const borrower = resolveLoanBorrower(loan, studentMap, teacherMap);
@@ -99,14 +83,14 @@ export function DashboardView() {
         return hay.includes(q);
       })
       .sort((a, b) => a.loan.dueDate.localeCompare(b.loan.dueDate));
-  }, [activeLoans, bookMap, classFilter, copyMap, search, studentMap, teacherMap, today]);
+  }, [activeLoans, bookMap, classFilter, copyMap, deferredSearch, studentMap, teacherMap, today]);
 
   if (!data) {
     return <p className="text-xs text-[#64748B]">Ma’lumotlar yuklanmoqda...</p>;
   }
 
-  const activeStudentsCount = data.students.filter((s) => s.status === 'active').length;
-  const activeTeachersCount = (data.teachers ?? []).filter((t) => t.status === 'active').length;
+  const activeStudentsCount = sortedActiveStudents.length;
+  const activeTeachersCount = sortedActiveTeachers.length;
 
   async function handleQuickImportBooks() {
     setBusyAction('books');
@@ -156,17 +140,7 @@ export function DashboardView() {
   async function handleQuickReturn(loanId: string) {
     setBusyAction(loanId);
     try {
-      const res = await authFetch('/api/loans', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'return', loanId, condition: 'good' }),
-      });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || 'Qaytarishda xatolik.');
-      toast.success('Kitob qaytarildi.');
-      await refreshData();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Xatolik yuz berdi.');
+      await returnLoanOptimistic(loanId);
     } finally {
       setBusyAction(null);
     }
@@ -262,18 +236,14 @@ export function DashboardView() {
 
       {/* Quick Actions */}
       <div className="flex flex-wrap items-center gap-2.5">
-        <Link href="/issue">
-          <Button variant="primary">
-            <BookUp2 className="w-4 h-4" />
-            Kitob berish
-          </Button>
-        </Link>
-        <Link href="/returns">
-          <Button variant="outline">
-            <RotateCcw className="w-4 h-4" />
-            Qaytarish
-          </Button>
-        </Link>
+        <Button variant="primary" onClick={() => navigate('/issue')}>
+          <BookUp2 className="w-4 h-4" />
+          Kitob berish
+        </Button>
+        <Button variant="outline" onClick={() => navigate('/returns')}>
+          <RotateCcw className="w-4 h-4" />
+          Qaytarish
+        </Button>
         <Button variant="outline" onClick={() => void downloadFullXlsx()}>
           <Download className="w-4 h-4" />
           Umumiy hisobot (XLSX)
@@ -343,7 +313,7 @@ export function DashboardView() {
             >
               <option value="">Barchasi</option>
               <option value="__teachers__">O‘qituvchilar</option>
-              {classes.map((c) => (
+              {activeClasses.map((c) => (
                 <option key={c} value={c}>
                   {c}
                 </option>

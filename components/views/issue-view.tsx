@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useMemo, useState } from 'react';
+import React, { useDeferredValue, useMemo, useState } from 'react';
 import { BookUp2, Check, GraduationCap, Plus, Search, Users } from 'lucide-react';
 import { toast } from 'sonner';
 import { useLibrary } from '@/components/library-context';
@@ -14,18 +14,19 @@ import {
   SelectField,
 } from '@/components/ui/primitives';
 import { authFetch } from '@/lib/api-client';
+import { patchLoansIssued, patchTeacherUpserted } from '@/lib/client-state-patch';
 import { addDaysYmd, getTodayTashkent } from '@/lib/date-utils';
 import type { BorrowerType } from '@/lib/types';
-import { compareClassNames } from '@/lib/utils';
 
 export function IssueView() {
-  const { data, refreshData } = useLibrary();
+  const { data, indexes, mutateData } = useLibrary();
 
   const today = data?.dashboard.today ?? getTodayTashkent();
 
   const [borrowerType, setBorrowerType] = useState<BorrowerType>('student');
   const [classFilter, setClassFilter] = useState('');
   const [borrowerQuery, setBorrowerQuery] = useState('');
+  const deferredBorrowerQuery = useDeferredValue(borrowerQuery);
   const [selectedStudentId, setSelectedStudentId] = useState('');
   const [selectedTeacherId, setSelectedTeacherId] = useState('');
 
@@ -36,6 +37,7 @@ export function IssueView() {
   const [addingTeacher, setAddingTeacher] = useState(false);
 
   const [bookQuery, setBookQuery] = useState('');
+  const deferredBookQuery = useDeferredValue(bookQuery);
   const [selectedBookId, setSelectedBookId] = useState('');
   const [selectedCopyId, setSelectedCopyId] = useState('');
 
@@ -43,23 +45,18 @@ export function IssueView() {
   const [dueDate, setDueDate] = useState(() => addDaysYmd(today, 14));
   const [submitting, setSubmitting] = useState(false);
 
-  const activeStudents = useMemo(
-    () => (data?.students ?? []).filter((s) => s.status === 'active'),
-    [data?.students]
-  );
-
-  const activeTeachers = useMemo(
-    () => (data?.teachers ?? []).filter((t) => t.status === 'active'),
-    [data?.teachers]
-  );
-
-  const classes = useMemo(() => {
-    const set = new Set<string>();
-    for (const s of activeStudents) {
-      if (s.className) set.add(s.className);
-    }
-    return Array.from(set).sort(compareClassNames);
-  }, [activeStudents]);
+  const {
+    sortedActiveStudents,
+    sortedActiveTeachers,
+    activeClasses,
+    studentMap,
+    teacherMap,
+    bookMap,
+    availableCopiesByBook,
+    studentSearchText,
+    teacherSearchText,
+    bookSearchText,
+  } = indexes;
 
   const activeLoansByStudent = useMemo(() => {
     const map = new Map<string, number>();
@@ -81,75 +78,46 @@ export function IssueView() {
     return map;
   }, [data?.loans]);
 
+  // sortedActiveStudents is already pre-sorted by class + name; early-stop at 60 matches!
   const filteredStudents = useMemo(() => {
-    const q = borrowerQuery.trim().toLowerCase();
-    return activeStudents
-      .filter((s) => {
-        if (classFilter && s.className !== classFilter) return false;
-        if (!q) return true;
-        return s.fullName.toLowerCase().includes(q) || s.className.toLowerCase().includes(q);
-      })
-      .sort((a, b) => {
-        const c = compareClassNames(a.className, b.className);
-        if (c !== 0) return c;
-        return a.fullName.localeCompare(b.fullName, 'uz');
-      })
-      .slice(0, 60);
-  }, [activeStudents, classFilter, borrowerQuery]);
+    const q = deferredBorrowerQuery.trim().toLowerCase();
+    const out = [];
+    for (const s of sortedActiveStudents) {
+      if (classFilter && s.className !== classFilter) continue;
+      if (q && !(studentSearchText.get(s.id) ?? '').includes(q)) continue;
+      out.push(s);
+      if (out.length >= 60) break;
+    }
+    return out;
+  }, [sortedActiveStudents, classFilter, deferredBorrowerQuery, studentSearchText]);
 
   const filteredTeachers = useMemo(() => {
-    const q = borrowerQuery.trim().toLowerCase();
-    return activeTeachers
-      .filter((t) => {
-        if (!q) return true;
-        return t.fullName.toLowerCase().includes(q) || t.position.toLowerCase().includes(q);
-      })
-      .sort((a, b) => a.fullName.localeCompare(b.fullName, 'uz'))
-      .slice(0, 60);
-  }, [activeTeachers, borrowerQuery]);
-
-  const availableCopiesByBook = useMemo(() => {
-    const map = new Map<string, Array<{ id: string; inv: string }>>();
-    for (const c of data?.physicalCopies ?? []) {
-      if (c.confirmed && c.status === 'available') {
-        const list = map.get(c.bookTitleId) ?? [];
-        list.push({ id: c.id, inv: c.originalInventoryNumber || c.internalCopyCode });
-        map.set(c.bookTitleId, list);
-      }
+    const q = deferredBorrowerQuery.trim().toLowerCase();
+    const out = [];
+    for (const t of sortedActiveTeachers) {
+      if (q && !(teacherSearchText.get(t.id) ?? '').includes(q)) continue;
+      out.push(t);
+      if (out.length >= 60) break;
     }
-    return map;
-  }, [data?.physicalCopies]);
+    return out;
+  }, [sortedActiveTeachers, deferredBorrowerQuery, teacherSearchText]);
 
   const availableBooks = useMemo(() => {
-    const q = bookQuery.trim().toLowerCase();
-    return (data?.bookTitles ?? [])
-      .filter((b) => {
-        const copies = availableCopiesByBook.get(b.id);
-        if (!copies || copies.length === 0) return false;
-        if (!q) return true;
-        return (
-          b.title.toLowerCase().includes(q) ||
-          b.author.toLowerCase().includes(q) ||
-          b.inventoryNumberRaw.toLowerCase().includes(q)
-        );
-      })
-      .slice(0, 60);
-  }, [availableCopiesByBook, bookQuery, data?.bookTitles]);
+    const q = deferredBookQuery.trim().toLowerCase();
+    const out = [];
+    for (const b of data?.bookTitles ?? []) {
+      const copies = availableCopiesByBook.get(b.id);
+      if (!copies || copies.length === 0) continue;
+      if (q && !(bookSearchText.get(b.id) ?? '').includes(q)) continue;
+      out.push(b);
+      if (out.length >= 60) break;
+    }
+    return out;
+  }, [availableCopiesByBook, bookSearchText, data?.bookTitles, deferredBookQuery]);
 
-  const selectedStudent = useMemo(
-    () => activeStudents.find((s) => s.id === selectedStudentId) ?? null,
-    [activeStudents, selectedStudentId]
-  );
-
-  const selectedTeacher = useMemo(
-    () => activeTeachers.find((t) => t.id === selectedTeacherId) ?? null,
-    [activeTeachers, selectedTeacherId]
-  );
-
-  const selectedBook = useMemo(
-    () => (data?.bookTitles ?? []).find((b) => b.id === selectedBookId) ?? null,
-    [data?.bookTitles, selectedBookId]
-  );
+  const selectedStudent = selectedStudentId ? studentMap.get(selectedStudentId) ?? null : null;
+  const selectedTeacher = selectedTeacherId ? teacherMap.get(selectedTeacherId) ?? null : null;
+  const selectedBook = selectedBookId ? bookMap.get(selectedBookId) ?? null : null;
 
   const selectedBookCopies = useMemo(
     () => (selectedBookId ? availableCopiesByBook.get(selectedBookId) ?? [] : []),
@@ -189,12 +157,14 @@ export function IssueView() {
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || 'O‘qituvchi qo‘shishda xatolik.');
+      if (json.teacher) {
+        mutateData((prev) => patchTeacherUpserted(prev, json.teacher));
+        setSelectedTeacherId(json.teacher.id);
+      }
       toast.success('O‘qituvchi qo‘shildi.');
-      setSelectedTeacherId(json.teacher.id);
       setAddTeacherOpen(false);
       setNewTeacherName('');
       setNewTeacherPosition('');
-      await refreshData();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Xatolik yuz berdi.');
     } finally {
@@ -237,10 +207,12 @@ export function IssueView() {
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || 'Kitob berishda xatolik.');
+      if (Array.isArray(json.loans)) {
+        mutateData((prev) => patchLoansIssued(prev, json.loans));
+      }
       toast.success('Kitob muvaffaqiyatli berildi.');
       setSelectedBookId('');
       setSelectedCopyId('');
-      await refreshData();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Xatolik yuz berdi.');
     } finally {
@@ -302,7 +274,7 @@ export function IssueView() {
                     className="sm:w-36"
                   >
                     <option value="">Barcha sinflar</option>
-                    {classes.map((c) => (
+                    {activeClasses.map((c) => (
                       <option key={c} value={c}>
                         {c}
                       </option>

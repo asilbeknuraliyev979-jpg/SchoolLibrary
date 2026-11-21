@@ -40,10 +40,13 @@ export const MAX_IP_LOGIN_ATTEMPTS = 10;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
 const LOGIN_LOCKOUT_MS = 15 * 60 * 1000; // 15 minutes
 
-// Persist rate-limit map & in-memory auth fallback across hot reloads in same Node process
+// Persist rate-limit map & in-memory auth cache across hot reloads in same Node process
 const globalAuth = globalThis as unknown as {
   __slLoginAttempts?: Map<string, LoginRateLimitRecord>;
   __slAuthStateMemory?: StoredAuthState;
+  __slAuthStateFile?: string;
+  __slAuthStateMtimeMs?: number;
+  __slAuthStateSize?: number;
 };
 
 const loginAttemptsStore =
@@ -270,33 +273,55 @@ function createInitialAuthState(): StoredAuthState {
 function writeAuthState(state: StoredAuthState): void {
   globalAuth.__slAuthStateMemory = state;
   const authFile = getAuthFilePath();
-  if (!authFile) return;
+  if (!authFile) {
+    globalAuth.__slAuthStateMtimeMs = undefined;
+    return;
+  }
 
   try {
     const tmp = `${authFile}.${crypto.randomBytes(4).toString('hex')}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
     fs.renameSync(tmp, authFile);
+    const stat = fs.statSync(authFile);
+    globalAuth.__slAuthStateFile = authFile;
+    globalAuth.__slAuthStateMtimeMs = stat.mtimeMs;
+    globalAuth.__slAuthStateSize = stat.size;
   } catch (err) {
+    globalAuth.__slAuthStateMtimeMs = undefined;
     console.warn('[auth-server] Failed to persist auth-state.json; keeping state in memory:', err);
   }
 }
 
 function readAuthState(): StoredAuthState {
   const authFile = getAuthFilePath();
-  if (authFile && fs.existsSync(authFile)) {
+  if (authFile) {
     try {
+      const stat = fs.statSync(authFile);
+      if (
+        globalAuth.__slAuthStateMemory &&
+        globalAuth.__slAuthStateFile === authFile &&
+        globalAuth.__slAuthStateMtimeMs === stat.mtimeMs &&
+        globalAuth.__slAuthStateSize === stat.size
+      ) {
+        return globalAuth.__slAuthStateMemory;
+      }
       const raw = fs.readFileSync(authFile, 'utf8');
       const parsed = JSON.parse(raw) as StoredAuthState;
       if (parsed?.account?.username && parsed?.sessionSecret) {
         globalAuth.__slAuthStateMemory = parsed;
+        globalAuth.__slAuthStateFile = authFile;
+        globalAuth.__slAuthStateMtimeMs = stat.mtimeMs;
+        globalAuth.__slAuthStateSize = stat.size;
         return parsed;
       }
     } catch (err) {
-      console.error('[auth-server] Failed to parse auth-state.json; recreating state:', err);
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        console.error('[auth-server] Failed to parse auth-state.json; recreating state:', err);
+      }
     }
   }
 
-  if (globalAuth.__slAuthStateMemory) {
+  if (globalAuth.__slAuthStateMemory && (!authFile || globalAuth.__slAuthStateMtimeMs === undefined)) {
     return globalAuth.__slAuthStateMemory;
   }
 

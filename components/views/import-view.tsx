@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Check,
@@ -46,8 +46,12 @@ type ReviewQueueFilter =
   | 'unconfirmed_only';
 
 export function ImportView() {
-  const { data, refreshData } = useLibrary();
+  const { data, ensureFullData, refreshData } = useLibrary();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    void ensureFullData();
+  }, [ensureFullData]);
 
   const [activeMode, setActiveMode] = useState<'wizard' | 'review' | 'history'>('wizard');
   const [stage, setStage] = useState<number>(0);

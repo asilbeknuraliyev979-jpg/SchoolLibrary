@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useDeferredValue, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   ChevronLeft,
@@ -23,6 +23,7 @@ import {
   SelectField,
 } from '@/components/ui/primitives';
 import { authFetch } from '@/lib/api-client';
+import { patchStudentCreated } from '@/lib/client-state-patch';
 import { formatDateTimeTashkent, getTodayTashkent } from '@/lib/date-utils';
 import type { StudentReplacePreview } from '@/lib/types';
 import { compareClassNames } from '@/lib/utils';
@@ -30,10 +31,11 @@ import { compareClassNames } from '@/lib/utils';
 const PAGE_SIZE = 50;
 
 export function StudentsView() {
-  const { data, refreshData, downloadTableXlsx } = useLibrary();
+  const { data, indexes, mutateData, refreshData, downloadTableXlsx } = useLibrary();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const [search, setSearch] = useState('');
+  const deferredSearch = useDeferredValue(search);
   const [classFilter, setClassFilter] = useState('');
   const [statusView, setStatusView] = useState<'active' | 'archived'>('active');
   const [page, setPage] = useState(1);
@@ -50,42 +52,36 @@ export function StudentsView() {
   // Rollback Confirmation Modal
   const [rollbackOpen, setRollbackOpen] = useState(false);
 
-  const allStudents = useMemo(() => data?.students ?? [], [data?.students]);
-  const activeStudents = useMemo(
-    () => allStudents.filter((s) => s.status === 'active'),
-    [allStudents]
-  );
-  const archivedStudents = useMemo(
-    () => allStudents.filter((s) => s.status === 'archived'),
-    [allStudents]
-  );
+  const {
+    sortedActiveStudents: activeStudents,
+    sortedArchivedStudents: archivedStudents,
+    activeClasses,
+    studentSearchText,
+  } = indexes;
 
   const currentList = statusView === 'active' ? activeStudents : archivedStudents;
 
-  const classes = useMemo(() => {
+  const archivedClasses = useMemo(() => {
+    if (statusView !== 'archived') return [];
     const set = new Set<string>();
-    for (const s of currentList) {
+    for (const s of archivedStudents) {
       if (s.className) set.add(s.className);
     }
     return Array.from(set).sort(compareClassNames);
-  }, [currentList]);
+  }, [archivedStudents, statusView]);
 
+  const classes = statusView === 'active' ? activeClasses : archivedClasses;
+
+  // currentList is already pre-sorted by class + name; no re-sorting on every search keystroke!
   const filteredStudents = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return currentList
-      .filter((s) => {
-        if (classFilter && s.className !== classFilter) return false;
-        if (!q) return true;
-        return (
-          s.fullName.toLowerCase().includes(q) || s.className.toLowerCase().includes(q)
-        );
-      })
-      .sort((a, b) => {
-        const c = compareClassNames(a.className, b.className);
-        if (c !== 0) return c;
-        return a.fullName.localeCompare(b.fullName, 'uz');
-      });
-  }, [currentList, classFilter, search]);
+    const q = deferredSearch.trim().toLowerCase();
+    if (!classFilter && !q) return currentList;
+    return currentList.filter((s) => {
+      if (classFilter && s.className !== classFilter) return false;
+      if (!q) return true;
+      return (studentSearchText.get(s.id) ?? '').includes(q);
+    });
+  }, [currentList, classFilter, deferredSearch, studentSearchText]);
 
   const totalPages = Math.max(1, Math.ceil(filteredStudents.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
@@ -210,11 +206,13 @@ export function StudentsView() {
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || 'O‘quvchi qo‘shishda xatolik.');
+      if (json.student) {
+        mutateData((prev) => patchStudentCreated(prev, json.student));
+      }
       toast.success('O‘quvchi qo‘shildi.');
       setAddOpen(false);
       setNewClass('');
       setNewFullName('');
-      await refreshData();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Xatolik yuz berdi.');
     } finally {

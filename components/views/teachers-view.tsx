@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useMemo, useState } from 'react';
+import React, { useDeferredValue, useMemo, useState } from 'react';
 import {
   Archive,
   Check,
@@ -23,13 +23,16 @@ import {
   StatusText,
 } from '@/components/ui/primitives';
 import { authFetch } from '@/lib/api-client';
+import { patchTeacherUpserted } from '@/lib/client-state-patch';
 import { classifyLoanDeadline, formatYmdDisplay, getTodayTashkent } from '@/lib/date-utils';
 import type { Teacher } from '@/lib/types';
+import { compareUzText } from '@/lib/utils';
 
 export function TeachersView() {
-  const { data, refreshData, downloadTableXlsx } = useLibrary();
+  const { data, indexes, mutateData, returnLoanOptimistic, downloadTableXlsx } = useLibrary();
 
   const [search, setSearch] = useState('');
+  const deferredSearch = useDeferredValue(search);
   const [statusTab, setStatusTab] = useState<'active' | 'archived'>('active');
   const [busy, setBusy] = useState(false);
 
@@ -44,19 +47,18 @@ export function TeachersView() {
   const [returningLoanId, setReturningLoanId] = useState<string | null>(null);
 
   const today = data?.dashboard.today ?? getTodayTashkent();
+  const { bookMap, copyMap, teacherSearchText, sortedActiveTeachers } = indexes;
 
   const teachers = useMemo(() => data?.teachers ?? [], [data?.teachers]);
-  const activeCount = useMemo(() => teachers.filter((t) => t.status === 'active').length, [teachers]);
-  const archivedCount = useMemo(() => teachers.filter((t) => t.status === 'archived').length, [teachers]);
-
-  const bookMap = useMemo(
-    () => new Map((data?.bookTitles ?? []).map((b) => [b.id, b])),
-    [data?.bookTitles]
+  const archivedTeachers = useMemo(
+    () =>
+      teachers
+        .filter((t) => t.status === 'archived')
+        .sort((a, b) => compareUzText(a.fullName, b.fullName)),
+    [teachers]
   );
-  const copyMap = useMemo(
-    () => new Map((data?.physicalCopies ?? []).map((c) => [c.id, c])),
-    [data?.physicalCopies]
-  );
+  const activeCount = sortedActiveTeachers.length;
+  const archivedCount = archivedTeachers.length;
 
   const teacherLoansMap = useMemo(() => {
     const map = new Map<string, { active: number; total: number }>();
@@ -72,18 +74,11 @@ export function TeachersView() {
   }, [data?.loans]);
 
   const filteredTeachers = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return teachers
-      .filter((t) => {
-        if (t.status !== statusTab) return false;
-        if (!q) return true;
-        return (
-          t.fullName.toLowerCase().includes(q) ||
-          t.position.toLowerCase().includes(q)
-        );
-      })
-      .sort((a, b) => a.fullName.localeCompare(b.fullName, 'uz'));
-  }, [search, statusTab, teachers]);
+    const list = statusTab === 'active' ? sortedActiveTeachers : archivedTeachers;
+    const q = deferredSearch.trim().toLowerCase();
+    if (!q) return list;
+    return list.filter((t) => (teacherSearchText.get(t.id) ?? '').includes(q));
+  }, [archivedTeachers, deferredSearch, sortedActiveTeachers, statusTab, teacherSearchText]);
 
   const historyLoans = useMemo(() => {
     if (!historyTeacher) return [];
@@ -141,9 +136,11 @@ export function TeachersView() {
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || 'Saqlashda xatolik.');
+      if (json.teacher) {
+        mutateData((prev) => patchTeacherUpserted(prev, json.teacher));
+      }
       toast.success(editingTeacher ? 'O‘qituvchi ma’lumotlari yangilandi.' : 'O‘qituvchi qo‘shildi.');
       setModalOpen(false);
-      await refreshData();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Xatolik yuz berdi.');
     } finally {
@@ -164,10 +161,12 @@ export function TeachersView() {
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || 'Holatni o‘zgartirishda xatolik.');
+      if (json.teacher) {
+        mutateData((prev) => patchTeacherUpserted(prev, json.teacher));
+      }
       toast.success(
         teacher.status === 'active' ? 'O‘qituvchi arxivlandi.' : 'O‘qituvchi faol ro‘yxatga qaytarildi.'
       );
-      await refreshData();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Xatolik yuz berdi.');
     } finally {
@@ -178,17 +177,7 @@ export function TeachersView() {
   async function handleReturnLoan(loanId: string) {
     setReturningLoanId(loanId);
     try {
-      const res = await authFetch('/api/loans', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'return', loanId, condition: 'good' }),
-      });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || 'Qaytarishda xatolik.');
-      toast.success('Kitob qaytarildi.');
-      await refreshData();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Xatolik yuz berdi.');
+      await returnLoanOptimistic(loanId);
     } finally {
       setReturningLoanId(null);
     }

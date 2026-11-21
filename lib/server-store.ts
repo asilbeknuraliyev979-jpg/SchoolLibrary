@@ -34,6 +34,9 @@ import { resolveWritableDataDir } from './storage-dir';
 
 const globalStore = globalThis as unknown as {
   __slMemoryDb?: LibraryDatabase;
+  __slMemoryDbFile?: string;
+  __slMemoryDbMtimeMs?: number;
+  __slMemoryDbSize?: number;
 };
 
 // Serialized promise queue to guarantee transactional consistency for concurrent requests
@@ -77,20 +80,34 @@ function getDbFilePath(): string | null {
 
 export function readDb(): LibraryDatabase {
   const dbFile = getDbFilePath();
-  if (dbFile && fs.existsSync(dbFile)) {
+  if (dbFile) {
     try {
+      const stat = fs.statSync(dbFile);
+      if (
+        globalStore.__slMemoryDb &&
+        globalStore.__slMemoryDbFile === dbFile &&
+        globalStore.__slMemoryDbMtimeMs === stat.mtimeMs &&
+        globalStore.__slMemoryDbSize === stat.size
+      ) {
+        return globalStore.__slMemoryDb;
+      }
       const raw = fs.readFileSync(dbFile, 'utf8');
       const parsed = JSON.parse(raw) as LibraryDatabase;
       if (!Array.isArray(parsed.teachers)) parsed.teachers = [];
       if (!Array.isArray(parsed.studentImportBackups)) parsed.studentImportBackups = [];
       globalStore.__slMemoryDb = parsed;
+      globalStore.__slMemoryDbFile = dbFile;
+      globalStore.__slMemoryDbMtimeMs = stat.mtimeMs;
+      globalStore.__slMemoryDbSize = stat.size;
       return parsed;
     } catch (err) {
-      console.error('[server-store] Failed to read library-store.json; using fallback state:', err);
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        console.error('[server-store] Failed to read library-store.json; using fallback state:', err);
+      }
     }
   }
 
-  if (globalStore.__slMemoryDb) {
+  if (globalStore.__slMemoryDb && (!dbFile || globalStore.__slMemoryDbMtimeMs === undefined)) {
     return globalStore.__slMemoryDb;
   }
 
@@ -102,13 +119,21 @@ export function readDb(): LibraryDatabase {
 function writeDbAtomic(db: LibraryDatabase) {
   globalStore.__slMemoryDb = db;
   const dbFile = getDbFilePath();
-  if (!dbFile) return;
+  if (!dbFile) {
+    globalStore.__slMemoryDbMtimeMs = undefined;
+    return;
+  }
 
   try {
     const tmp = `${dbFile}.${crypto.randomBytes(4).toString('hex')}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(db), { mode: 0o600 });
     fs.renameSync(tmp, dbFile);
+    const stat = fs.statSync(dbFile);
+    globalStore.__slMemoryDbFile = dbFile;
+    globalStore.__slMemoryDbMtimeMs = stat.mtimeMs;
+    globalStore.__slMemoryDbSize = stat.size;
   } catch (err) {
+    globalStore.__slMemoryDbMtimeMs = undefined;
     console.warn('[server-store] Failed to persist library-store.json; keeping state in memory:', err);
   }
 }
@@ -1587,41 +1612,68 @@ export function computeSmartNotifications(db: LibraryDatabase): NotificationItem
 
 export function buildDashboardSummary(db: LibraryDatabase) {
   const today = getTodayTashkent();
-  const confirmedCopies = db.physicalCopies.filter((c) => c.confirmed && c.status !== 'archived');
-  const availableCopies = confirmedCopies.filter((c) => c.status === 'available');
-  const issuedCopies = confirmedCopies.filter((c) => c.status === 'issued');
-  const activeLoans = db.loans.filter((l) => l.status === 'active');
-  const dueToday = activeLoans.filter((l) => classifyLoanDeadline(l, today).bucket === 'due_today');
-  const overdue = activeLoans.filter((l) => classifyLoanDeadline(l, today).bucket === 'overdue');
-  const activeBorrowers = new Set(
-    activeLoans.map((l) =>
-      l.borrowerType === 'teacher' ? `tch:${l.teacherId ?? ''}` : `stu:${l.studentId ?? ''}`
-    )
-  );
-  const booksNeedingReview = db.bookTitles.filter((b) => b.reviewStatus === 'needs_review');
 
-  // 14-day daily issue/return activity chart from REAL loans
+  let totalConfirmedCopies = 0;
+  let availableCopies = 0;
+  let issuedCopies = 0;
+  for (const c of db.physicalCopies) {
+    if (c.confirmed && c.status !== 'archived') {
+      totalConfirmedCopies++;
+      if (c.status === 'available') availableCopies++;
+      else if (c.status === 'issued') issuedCopies++;
+    }
+  }
+
+  const dueToday: Loan[] = [];
+  const overdue: Loan[] = [];
+  const activeBorrowers = new Set<string>();
+  const issuedByDate = new Map<string, number>();
+  const returnedByDate = new Map<string, number>();
+  const borrowCounts = new Map<string, number>();
+
+  for (const l of db.loans) {
+    borrowCounts.set(l.bookTitleId, (borrowCounts.get(l.bookTitleId) ?? 0) + 1);
+    if (l.issuedDate) {
+      issuedByDate.set(l.issuedDate, (issuedByDate.get(l.issuedDate) ?? 0) + 1);
+    }
+    if (l.returnedDate) {
+      returnedByDate.set(l.returnedDate, (returnedByDate.get(l.returnedDate) ?? 0) + 1);
+    }
+    if (l.status === 'active') {
+      activeBorrowers.add(
+        l.borrowerType === 'teacher' ? `tch:${l.teacherId ?? ''}` : `stu:${l.studentId ?? ''}`
+      );
+      const bucket = classifyLoanDeadline(l, today).bucket;
+      if (bucket === 'due_today') dueToday.push(l);
+      else if (bucket === 'overdue') overdue.push(l);
+    }
+  }
+
+  let totalCatalogRecords = 0;
+  const booksNeedingReview: BookTitle[] = [];
+  const bookById = new Map<string, BookTitle>();
+  for (const b of db.bookTitles) {
+    bookById.set(b.id, b);
+    if (b.reviewStatus !== 'archived') totalCatalogRecords++;
+    if (b.reviewStatus === 'needs_review') booksNeedingReview.push(b);
+  }
+
+  // 14-day daily issue/return activity chart from REAL loans (O(1) map lookups)
   const activitySeries: Array<{ date: string; label: string; berilgan: number; qaytarilgan: number }> = [];
   for (let i = 13; i >= 0; i--) {
     const d = addDaysYmd(today, -i);
-    const issuedCount = db.loans.filter((l) => l.issuedDate === d).length;
-    const returnedCount = db.loans.filter((l) => l.returnedDate === d).length;
     activitySeries.push({
       date: d,
       label: `${d.slice(8, 10)}.${d.slice(5, 7)}`,
-      berilgan: issuedCount,
-      qaytarilgan: returnedCount,
+      berilgan: issuedByDate.get(d) ?? 0,
+      qaytarilgan: returnedByDate.get(d) ?? 0,
     });
   }
 
-  // Most borrowed books from REAL loans
-  const borrowCounts = new Map<string, number>();
-  for (const l of db.loans) {
-    borrowCounts.set(l.bookTitleId, (borrowCounts.get(l.bookTitleId) ?? 0) + 1);
-  }
+  // Most borrowed books from REAL loans (O(1) book lookup)
   const topBooks = Array.from(borrowCounts.entries())
     .map(([bookTitleId, count]) => {
-      const book = db.bookTitles.find((b) => b.id === bookTitleId);
+      const book = bookById.get(bookTitleId);
       return {
         bookTitleId,
         title: book?.title ?? 'Noma’lum kitob',
@@ -1632,19 +1684,28 @@ export function buildDashboardSummary(db: LibraryDatabase) {
     .sort((a, b) => b.count - a.count)
     .slice(0, 8);
 
+  let totalStudents = 0;
+  for (const s of db.students) {
+    if (s.status === 'active') totalStudents++;
+  }
+  let totalTeachers = 0;
+  for (const t of db.teachers ?? []) {
+    if (t.status === 'active') totalTeachers++;
+  }
+
   return {
     today,
     stats: {
-      totalConfirmedCopies: confirmedCopies.length,
-      availableCopies: availableCopies.length,
-      issuedCopies: issuedCopies.length,
+      totalConfirmedCopies,
+      availableCopies,
+      issuedCopies,
       dueTodayCount: dueToday.length,
       overdueCount: overdue.length,
       activeBorrowersCount: activeBorrowers.size,
-      totalCatalogRecords: db.bookTitles.filter((b) => b.reviewStatus !== 'archived').length,
+      totalCatalogRecords,
       needsReviewCount: booksNeedingReview.length,
-      totalStudents: db.students.filter((s) => s.status === 'active').length,
-      totalTeachers: (db.teachers ?? []).filter((t) => t.status === 'active').length,
+      totalStudents,
+      totalTeachers,
     },
     dueTodayLoans: dueToday.slice(0, 10),
     overdueLoans: overdue.slice(0, 10),
